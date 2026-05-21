@@ -1,0 +1,28 @@
+{
+  "name": "riftcontrol-bot",
+  "version": "1.0.0",
+  "description": "Bot de WhatsApp para controle de guilda Wild Rift com XP, KDA, ranking e Supabase.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "baileys",
+    "wild-rift",
+    "guilda",
+    "supabase"
+  ],
+  "author": "RiftControl",
+  "license": "MIT",
+  "dependencies": {
+    "@hapi/boom": "^10.0.1",
+    "@supabase/supabase-js": "^2.45.4",
+    "@whiskeysockets/baileys": "^6.7.22",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "pino": "^9.3.2",
+    "qrcode": "^1.5.4"
+  }
+}

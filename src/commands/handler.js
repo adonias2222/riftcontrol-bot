@@ -1,0 +1,249 @@
+const { getMessageText, getSenderId, formatarNumero } = require('../utils/message');
+const { cadastrarOuAtualizarMembro, buscarMembroPorWhatsapp, buscarRanking } = require('../services/membros');
+const { registrarPartida, buscarHistorico, buscarStats } = require('../services/partidas');
+
+async function responder(sock, msg, texto) {
+  await sock.sendMessage(
+    msg.key.remoteJid,
+    { text: texto },
+    { quoted: msg }
+  );
+}
+
+function menu() {
+  return `⚔️ *RiftControl - Guilda Wild Rift*
+
+👤 *Perfil*
+!cadastrar nick elo rota
+!perfil
+!stats
+!historico
+
+🎮 *Partidas*
+!partida vitória 12/3/8 ranked jungle
+!partida derrota 4/7/10 normal suporte
+!partida vitória 15/0/6 ranked adc mvp guilda
+
+🏆 *Ranking*
+!ranking
+
+ℹ️ *Ajuda*
+!menu`;
+}
+
+function ajudaCadastro() {
+  return `Use assim:
+
+!cadastrar DarkJungle esmeralda jungle
+
+Exemplo:
+!cadastrar Luxzinha ouro suporte`;
+}
+
+function ajudaPartida() {
+  return `Use assim:
+
+!partida vitória 12/3/8 ranked jungle
+
+Extras opcionais:
+mvp | guilda | torneio
+
+Exemplo:
+!partida vitória 15/0/6 ranked adc mvp guilda`;
+}
+
+async function handleCommand(sock, msg) {
+  const text = getMessageText(msg);
+
+  if (!text.startsWith('!')) return;
+
+  const senderId = getSenderId(msg);
+  const pushName = msg.pushName || 'Jogador';
+
+  const partes = text.trim().split(/\s+/);
+  const comando = partes.shift().replace('!', '').toLowerCase();
+  const args = partes;
+
+  try {
+    if (comando === 'menu' || comando === 'ajuda') {
+      return responder(sock, msg, menu());
+    }
+
+    if (comando === 'cadastrar') {
+      if (args.length < 3) {
+        return responder(sock, msg, ajudaCadastro());
+      }
+
+      const [nick, elo, rota] = args;
+
+      const { membro, atualizado } = await cadastrarOuAtualizarMembro({
+        whatsappId: senderId,
+        nome: pushName,
+        nick,
+        elo,
+        rota
+      });
+
+      return responder(
+        sock,
+        msg,
+        `${atualizado ? '♻️ Cadastro atualizado!' : '✅ Cadastro realizado!'}
+
+👤 Nick: ${membro.nick}
+🏅 Elo: ${membro.elo}
+🛣️ Rota: ${membro.rota}
+⭐ XP: ${membro.xp}
+🎖️ Cargo: ${membro.cargo}`
+      );
+    }
+
+    if (comando === 'perfil') {
+      const membro = await buscarMembroPorWhatsapp(senderId);
+
+      if (!membro) {
+        return responder(sock, msg, 'Você ainda não está cadastrado. Use: !cadastrar nick elo rota');
+      }
+
+      return responder(
+        sock,
+        msg,
+        `👤 *Perfil*
+
+Nick: ${membro.nick}
+Nome: ${membro.nome || '-'}
+Elo: ${membro.elo || '-'}
+Rota: ${membro.rota || '-'}
+XP: ${membro.xp}
+Cargo: ${membro.cargo}
+Presenças: ${membro.presencas}
+Faltas: ${membro.faltas}`
+      );
+    }
+
+    if (comando === 'partida') {
+      if (args.length < 4) {
+        return responder(sock, msg, ajudaPartida());
+      }
+
+      const [resultado, kdaTexto, modo, rota, ...extras] = args;
+      const kdaPartes = kdaTexto.split('/');
+
+      if (kdaPartes.length !== 3) {
+        return responder(sock, msg, ajudaPartida());
+      }
+
+      const [kills, deaths, assists] = kdaPartes;
+      const extrasTexto = extras.join(' ').toLowerCase();
+
+      const resultadoRegistro = await registrarPartida({
+        whatsappId: senderId,
+        resultado,
+        kills,
+        deaths,
+        assists,
+        modo,
+        rota,
+        mvp: extrasTexto.includes('mvp'),
+        comGuilda: extrasTexto.includes('guilda'),
+        torneio: extrasTexto.includes('torneio') || extrasTexto.includes('md3')
+      });
+
+      if (!resultadoRegistro.ok) {
+        return responder(sock, msg, resultadoRegistro.mensagem);
+      }
+
+      const { membro, partida, kda, xpGanho } = resultadoRegistro;
+
+      return responder(
+        sock,
+        msg,
+        `⚔️ *Partida registrada!*
+
+Jogador: ${membro.nick}
+Resultado: ${partida.resultado}
+Modo: ${partida.modo}
+Rota: ${partida.rota}
+K/D/A: ${partida.kills}/${partida.deaths}/${partida.assists}
+KDA: ${kda}
+
+⭐ XP ganho: +${xpGanho}
+🏆 XP total: ${membro.xp}
+🎖️ Cargo: ${membro.cargo}`
+      );
+    }
+
+    if (comando === 'ranking' || comando === 'rank') {
+      const ranking = await buscarRanking(10);
+
+      if (!ranking.length) {
+        return responder(sock, msg, 'Ainda não há membros no ranking.');
+      }
+
+      const linhas = ranking.map((membro, index) => {
+        return `${index + 1}º ${membro.nick} - ${membro.xp} XP - ${membro.cargo}`;
+      });
+
+      return responder(sock, msg, `🏆 *Ranking da Guilda*\n\n${linhas.join('\n')}`);
+    }
+
+    if (comando === 'historico') {
+      const resultado = await buscarHistorico(senderId, 5);
+
+      if (!resultado.ok) {
+        return responder(sock, msg, resultado.mensagem);
+      }
+
+      if (!resultado.partidas.length) {
+        return responder(sock, msg, 'Você ainda não registrou partidas.');
+      }
+
+      const linhas = resultado.partidas.map((p, index) => {
+        return `${index + 1}. ${p.resultado} | ${p.kills}/${p.deaths}/${p.assists} | KDA ${p.kda} | +${p.xp_ganho} XP`;
+      });
+
+      return responder(
+        sock,
+        msg,
+        `📜 *Histórico - ${resultado.membro.nick}*\n\n${linhas.join('\n')}`
+      );
+    }
+
+    if (comando === 'stats') {
+      const resultado = await buscarStats(senderId);
+
+      if (!resultado.ok) {
+        return responder(sock, msg, resultado.mensagem);
+      }
+
+      const { membro, stats } = resultado;
+
+      return responder(
+        sock,
+        msg,
+        `📊 *Stats - ${membro.nick}*
+
+Partidas: ${stats.total}
+Vitórias: ${stats.vitorias}
+Derrotas: ${stats.derrotas}
+Winrate: ${formatarNumero(stats.winrate)}%
+
+Abates: ${stats.kills}
+Mortes: ${stats.deaths}
+Assistências: ${stats.assists}
+
+KDA geral: ${formatarNumero(stats.kdaGeral)}
+Melhor KDA: ${formatarNumero(stats.melhorKda)}
+XP por partidas: ${stats.xpPartidas}
+XP total: ${membro.xp}
+Cargo: ${membro.cargo}`
+      );
+    }
+
+    return responder(sock, msg, 'Comando não encontrado. Use !menu');
+  } catch (error) {
+    console.error('Erro no comando:', error);
+    return responder(sock, msg, `❌ Erro ao executar comando: ${error.message}`);
+  }
+}
+
+module.exports = handleCommand;
