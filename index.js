@@ -771,6 +771,9 @@ async function connectToWhatsApp() {
         try {
           if (!msg.message) continue;
 
+          // Ignorar mensagens de status do WhatsApp (stories/status@broadcast)
+          if (msg.key?.remoteJid === 'status@broadcast') continue;
+
           await handleCommand(sock, msg);
         } catch (error) {
           lastError = error?.stack || String(error);
@@ -803,7 +806,7 @@ async function connectToWhatsApp() {
       if (connection === 'close') {
         currentSock = null;
 
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errorText =
           lastDisconnect?.error?.stack ||
           lastDisconnect?.error?.message ||
@@ -866,3 +869,4 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`${BOT_NAME} servidor HTTP rodando em 0.0.0.0:${PORT}. instance=${INSTANCE_ID}`);
   setTimeout(connectToWhatsApp, 1500);
 });
+
