@@ -27,8 +27,23 @@ function menu() {
 🏆 *Ranking*
 !ranking
 
+🧪 *Teste*
+!Naldo
+
 ℹ️ *Ajuda*
 !menu`;
+}
+
+function textoNaldo() {
+  return `🤖 *RiftControl - Automação ativa!*
+
+Olá, Naldo! Este é um comando de teste da automação da guilda.
+
+✅ O bot está recebendo mensagens no WhatsApp.
+✅ A automação está processando comandos.
+✅ O sistema está pronto para controlar membros, XP, ranking, histórico de partidas e KDA.
+
+Use *!menu* para ver todos os comandos disponíveis.`;
 }
 
 function ajudaCadastro() {
@@ -67,6 +82,10 @@ async function handleCommand(sock, msg) {
   try {
     if (comando === 'menu' || comando === 'ajuda') {
       return responder(sock, msg, menu());
+    }
+
+    if (comando === 'naldo') {
+      return responder(sock, msg, textoNaldo());
     }
 
     if (comando === 'cadastrar') {
