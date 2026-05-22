@@ -43,7 +43,11 @@ async function cadastrarOuAtualizarMembro({ whatsappId, nome, nick, elo, rota })
       nome,
       nick,
       elo,
-      rota
+      rota,
+      xp: 0,
+      cargo: 'Recruta',
+      presencas: 0,
+      faltas: 0
     })
     .select('*')
     .single();
