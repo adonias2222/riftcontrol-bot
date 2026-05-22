@@ -36,10 +36,18 @@ let totalCommands = 0;
 let reconnectCount = 0;
 let qrCount = 0;
 let baileysVersion = null;
+let lastPairingCode = null;
+let lastPairingPhone = null;
+let lastPairingAt = null;
+let pairingCount = 0;
 
 function senhaOk(req) {
   if (!QR_PASSWORD) return true;
   return req.query.key === QR_PASSWORD || req.headers['x-panel-key'] === QR_PASSWORD;
+}
+
+function onlyDigits(value) {
+  return String(value || '').replace(/\D/g, '');
 }
 
 function escapeHtml(value) {
@@ -83,12 +91,16 @@ function montarStatus() {
     conectado: status === 'conectado',
     qrDisponivel: Boolean(currentQr),
     socketDisponivel: Boolean(sock),
+    pairingDisponivel: Boolean(lastPairingCode),
+    lastPairingAt,
+    lastPairingPhone,
+    pairingCount,
     reconnecting,
     startedAt,
     uptimeMs,
     uptime: formatDuration(uptimeMs),
     now: new Date().toISOString(),
-    auth: 'local-useMultiFileAuthState',
+    auth: 'local-useMultiFileAuthState + pairing-code',
     authFolder: AUTH_FOLDER,
     lastQrAt,
     lastOpenAt,
@@ -125,6 +137,48 @@ function montarStatus() {
   };
 }
 
+async function gerarPairingCode(phone) {
+  const numero = onlyDigits(phone);
+
+  if (!numero || numero.length < 10) {
+    const erro = new Error('Informe o número com DDI e DDD. Exemplo: 5598999999999.');
+    erro.statusCode = 400;
+    throw erro;
+  }
+
+  if (status === 'conectado') {
+    const erro = new Error('O bot já está conectado ao WhatsApp. Para parear outro número, limpe a pasta auth_info ou recrie o deploy sem sessão antiga.');
+    erro.statusCode = 409;
+    throw erro;
+  }
+
+  if (!sock) {
+    iniciarBot();
+    const erro = new Error('Socket ainda está iniciando. Aguarde alguns segundos e tente gerar o código novamente.');
+    erro.statusCode = 503;
+    throw erro;
+  }
+
+  if (typeof sock.requestPairingCode !== 'function') {
+    const erro = new Error('Esta versão do Baileys não possui requestPairingCode. Use o QR Code.');
+    erro.statusCode = 500;
+    throw erro;
+  }
+
+  status = 'gerando código de pareamento';
+  lastError = null;
+
+  const code = await sock.requestPairingCode(numero);
+
+  lastPairingCode = code;
+  lastPairingPhone = numero;
+  lastPairingAt = new Date().toISOString();
+  pairingCount += 1;
+  status = 'aguardando código no WhatsApp';
+
+  return { phone: numero, code, generatedAt: lastPairingAt };
+}
+
 app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.set('Pragma', 'no-cache');
@@ -157,8 +211,86 @@ app.get('/api/qr', async (req, res) => {
   return res.json({ ok: true, qrDisponivel: true, status, lastQrAt, qrImage });
 });
 
+app.get('/api/pairing', async (req, res) => {
+  if (!senhaOk(req)) {
+    return res.status(401).json({ ok: false, error: 'Senha incorreta.' });
+  }
+
+  try {
+    const resultado = await gerarPairingCode(req.query.phone);
+    return res.json({ ok: true, ...resultado, status });
+  } catch (error) {
+    lastError = error?.stack || String(error);
+    return res.status(error.statusCode || 500).json({ ok: false, error: error.message || String(error), status });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send(renderDashboard(escapeHtml(BOT_NAME)));
+});
+
+app.get('/pairing', async (req, res) => {
+  if (!senhaOk(req)) {
+    return res.status(401).send('Senha incorreta.');
+  }
+
+  const phone = onlyDigits(req.query.phone);
+
+  if (!phone) {
+    return res.send(`
+      <html>
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <title>${escapeHtml(BOT_NAME)} | Pareamento por número</title>
+        </head>
+        <body style="font-family:Arial;background:#0b1020;color:white;padding:24px">
+          <div style="max-width:620px;margin:auto;background:#151b2f;padding:24px;border-radius:18px">
+            <h1>🔐 Pareamento por número</h1>
+            <p>Digite o número com DDI e DDD. Exemplo: <strong>5598999999999</strong>.</p>
+            <form action="/pairing" method="GET">
+              <input name="key" type="password" placeholder="Senha QR_PASSWORD" value="${escapeHtml(req.query.key || '')}" style="width:100%;padding:14px;border-radius:12px;margin:8px 0" />
+              <input name="phone" type="tel" placeholder="Número com DDI e DDD" style="width:100%;padding:14px;border-radius:12px;margin:8px 0" />
+              <button style="width:100%;padding:14px;border-radius:12px;background:#38bdf8;color:#020617;font-weight:bold;border:0">Gerar código</button>
+            </form>
+            <p><a href="/" style="color:#7dd3fc">Voltar ao painel</a></p>
+          </div>
+        </body>
+      </html>
+    `);
+  }
+
+  try {
+    const resultado = await gerarPairingCode(phone);
+    return res.send(`
+      <html>
+        <head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
+        <body style="font-family:Arial;background:#0b1020;color:white;text-align:center;padding:24px">
+          <div style="max-width:620px;margin:auto;background:#151b2f;padding:24px;border-radius:18px">
+            <h1>🔐 Código de pareamento</h1>
+            <p>Número: <strong>${escapeHtml(resultado.phone)}</strong></p>
+            <p>Digite este código imediatamente no WhatsApp:</p>
+            <div style="font-size:38px;letter-spacing:8px;background:#050816;padding:22px;border-radius:16px;color:#bbf7d0;font-weight:bold">${escapeHtml(resultado.code)}</div>
+            <p>O código expira rápido. Se der expirado, gere outro.</p>
+            <p><a href="/" style="color:#7dd3fc">Voltar ao painel</a></p>
+          </div>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    lastError = error?.stack || String(error);
+    return res.status(error.statusCode || 500).send(`
+      <html>
+        <head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
+        <body style="font-family:Arial;background:#0b1020;color:white;padding:24px">
+          <div style="max-width:760px;margin:auto;background:#151b2f;padding:24px;border-radius:18px">
+            <h1>❌ Erro ao gerar código</h1>
+            <pre style="white-space:pre-wrap;background:#050816;padding:14px;border-radius:12px;color:#fecaca">${escapeHtml(error.message || String(error))}</pre>
+            <p><a href="/pairing?key=${encodeURIComponent(req.query.key || '')}" style="color:#7dd3fc">Tentar novamente</a></p>
+          </div>
+        </body>
+      </html>
+    `);
+  }
 });
 
 app.get('/qr', async (req, res) => {
@@ -283,6 +415,7 @@ async function iniciarBot() {
 
       if (connection === 'open') {
         currentQr = null;
+        lastPairingCode = null;
         status = 'conectado';
         lastError = null;
         reconnecting = false;
