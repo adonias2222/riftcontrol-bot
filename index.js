@@ -8,10 +8,12 @@ const PORT = Number(process.env.PORT || 3000);
 const BOT_NAME = process.env.BOT_NAME || 'RiftControl';
 
 let currentQr = null;
+let currentSock = null;
 let connectionStatus = 'iniciando';
 let reconnecting = false;
 let botModules = null;
 let lastError = null;
+let lastPairingCode = null;
 let startedAt = new Date().toISOString();
 
 process.on('uncaughtException', (error) => {
@@ -33,6 +35,10 @@ function escapeHtml(value) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
+}
+
+function onlyDigits(value) {
+  return String(value || '').replace(/\D/g, '');
 }
 
 function loadBotModules() {
@@ -65,15 +71,20 @@ function loadBotModules() {
 function baseStyles() {
   return `
     body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; }
-    .card { max-width: 680px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; box-shadow: 0 18px 55px rgba(0,0,0,.35); }
+    .card { max-width: 760px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; box-shadow: 0 18px 55px rgba(0,0,0,.35); }
     h1 { margin-top: 0; }
     input { width: 100%; box-sizing: border-box; padding: 14px; border-radius: 12px; border: 1px solid #334155; background: #050816; color: white; font-size: 16px; margin: 10px 0; }
     button { width: 100%; padding: 14px; border: 0; border-radius: 12px; background: #38bdf8; color: #020617; font-weight: 700; font-size: 16px; cursor: pointer; }
+    button.secondary { background: #a78bfa; margin-top: 6px; }
     a { color: #7dd3fc; }
     code, pre { background: #050816; padding: 4px 8px; border-radius: 8px; }
     pre { white-space: pre-wrap; overflow-wrap: break-word; padding: 12px; color: #fecaca; }
     .muted { color: #cbd5e1; font-size: 14px; }
     .status { display: inline-block; padding: 6px 10px; background: #0f172a; border-radius: 999px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
+    .box { background: #0f172a; padding: 16px; border-radius: 16px; border: 1px solid #23314f; }
+    .code { font-size: 34px; letter-spacing: 6px; text-align: center; padding: 18px; color: #bbf7d0; }
+    @media (min-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } }
   `;
 }
 
@@ -90,15 +101,27 @@ app.get('/', (req, res) => {
           <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
           <p>Status: <strong class="status">${escapeHtml(connectionStatus)}</strong></p>
 
-          <h2>Entrar no QR Code</h2>
-          <p class="muted">Digite a senha configurada em <strong>QR_PASSWORD</strong>. Ao enviar, a página abre o QR automaticamente.</p>
+          <div class="grid">
+            <div class="box">
+              <h2>Conectar por código</h2>
+              <p class="muted">Digite a senha e o número do WhatsApp do bot com DDI + DDD. Exemplo: <strong>5598999999999</strong>.</p>
+              <form action="/pairing" method="GET">
+                <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
+                <input name="phone" type="tel" inputmode="numeric" placeholder="Número com DDI e DDD. Ex: 5598999999999" required />
+                <button class="secondary" type="submit">Gerar código de pareamento</button>
+              </form>
+            </div>
 
-          <form action="/qr" method="GET">
-            <input name="key" type="password" placeholder="Digite a senha do QR" autocomplete="current-password" required />
-            <button type="submit">Abrir QR Code</button>
-          </form>
+            <div class="box">
+              <h2>Conectar por QR Code</h2>
+              <p class="muted">Método tradicional. Digite a senha e abra o QR Code.</p>
+              <form action="/qr" method="GET">
+                <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
+                <button type="submit">Abrir QR Code</button>
+              </form>
+            </div>
+          </div>
 
-          <p class="muted">Também funciona usando: <code>/qr?key=SUA_SENHA</code></p>
           <p class="muted">Diagnóstico: <a href="/status">/status</a></p>
           ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
         </div>
@@ -121,6 +144,8 @@ app.get('/status', (req, res) => {
     bot: BOT_NAME,
     status: connectionStatus,
     qrDisponivel: Boolean(currentQr),
+    socketDisponivel: Boolean(currentSock),
+    pairingCodeDisponivel: Boolean(lastPairingCode),
     porta: PORT,
     startedAt,
     env: {
@@ -196,6 +221,80 @@ app.get('/qr', async (req, res) => {
   `);
 });
 
+app.get('/pairing', async (req, res) => {
+  const senha = process.env.QR_PASSWORD;
+  const phone = onlyDigits(req.query.phone);
+
+  if (senha && req.query.key !== senha) {
+    return res.status(401).send(`
+      <html>
+        <head><title>Acesso negado - ${escapeHtml(BOT_NAME)}</title><meta name="viewport" content="width=device-width, initial-scale=1" /><style>${baseStyles()}</style></head>
+        <body><div class="card"><h1>🔒 Acesso negado</h1><p>A senha informada está errada.</p><a href="/">Voltar</a></div></body>
+      </html>
+    `);
+  }
+
+  if (!phone || phone.length < 10) {
+    return res.status(400).send(`
+      <html>
+        <head><title>Número inválido - ${escapeHtml(BOT_NAME)}</title><meta name="viewport" content="width=device-width, initial-scale=1" /><style>${baseStyles()}</style></head>
+        <body><div class="card"><h1>📱 Número inválido</h1><p>Informe o número com DDI e DDD. Exemplo: <strong>5598999999999</strong>.</p><a href="/">Voltar</a></div></body>
+      </html>
+    `);
+  }
+
+  if (!currentSock) {
+    return res.status(503).send(`
+      <html>
+        <head><title>Bot iniciando - ${escapeHtml(BOT_NAME)}</title><meta name="viewport" content="width=device-width, initial-scale=1" /><meta http-equiv="refresh" content="5" /><style>${baseStyles()}</style></head>
+        <body><div class="card"><h1>⏳ Bot iniciando</h1><p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p><p>Aguarde alguns segundos e tente novamente.</p>${lastError ? `<pre>${escapeHtml(lastError)}</pre>` : ''}</div></body>
+      </html>
+    `);
+  }
+
+  try {
+    if (typeof currentSock.requestPairingCode !== 'function') {
+      throw new Error('Esta versão do Baileys não possui requestPairingCode. Use o QR Code ou atualize o Baileys.');
+    }
+
+    const code = await currentSock.requestPairingCode(phone);
+    lastPairingCode = code;
+
+    return res.send(`
+      <html>
+        <head>
+          <title>Código de pareamento - ${escapeHtml(BOT_NAME)}</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <style>${baseStyles()}</style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>🔐 Código de pareamento</h1>
+            <p>Use este código para conectar o WhatsApp do bot:</p>
+            <pre class="code">${escapeHtml(code)}</pre>
+            <p class="muted">No WhatsApp do número ${escapeHtml(phone)}, vá em <strong>Dispositivos conectados</strong> e escolha a opção de conectar usando número/código, quando disponível.</p>
+            <p class="muted">Se o código expirar, volte para a página inicial e gere outro.</p>
+            <a href="/status">Ver status</a>
+          </div>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    lastError = error?.stack || String(error);
+    return res.status(500).send(`
+      <html>
+        <head><title>Erro ao gerar código - ${escapeHtml(BOT_NAME)}</title><meta name="viewport" content="width=device-width, initial-scale=1" /><style>${baseStyles()}</style></head>
+        <body><div class="card"><h1>❌ Erro ao gerar código</h1><pre>${escapeHtml(lastError)}</pre><a href="/">Voltar</a></div></body>
+      </html>
+    `);
+  }
+});
+
+app.get('/pair', (req, res) => {
+  const params = new URLSearchParams(req.query).toString();
+  res.redirect(`/pairing${params ? `?${params}` : ''}`);
+});
+
 // Atalho opcional: se abrir /SUA_SENHA, redireciona para /qr?key=SUA_SENHA.
 app.get('/:key', (req, res) => {
   const key = req.params.key;
@@ -244,6 +343,8 @@ async function connectToWhatsApp() {
       browser: [BOT_NAME, 'Chrome', '1.0.0']
     });
 
+    currentSock = sock;
+
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
@@ -266,18 +367,20 @@ async function connectToWhatsApp() {
 
       if (qr) {
         currentQr = qr;
-        connectionStatus = 'aguardando QR Code';
-        console.log('QR Code gerado. Abra a URL principal e digite a senha.');
+        connectionStatus = 'aguardando QR Code ou código';
+        console.log('QR Code gerado. Também é possível gerar código de pareamento na página inicial.');
       }
 
       if (connection === 'open') {
         currentQr = null;
+        lastPairingCode = null;
         connectionStatus = 'conectado';
         lastError = null;
         console.log(`${BOT_NAME} conectado ao WhatsApp.`);
       }
 
       if (connection === 'close') {
+        currentSock = null;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const deslogado = statusCode === DisconnectReason.loggedOut;
 
