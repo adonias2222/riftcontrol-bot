@@ -10,11 +10,13 @@ function onlyDigits(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+function limparId(value) {
+  return String(value || '').trim();
+}
+
 function normalizarNumeroBR(numero) {
   const n = onlyDigits(numero);
 
-  // Formato BR com DDI 55 + DDD + 9 dígitos. Ex: 5598991748767
-  // Algumas sessões do WhatsApp podem aparecer sem o 9 depois do DDD. Ex: 559891748767
   if (n.startsWith('55') && n.length === 13) {
     const semNonoDigito = n.slice(0, 4) + n.slice(5);
     return [n, semNonoDigito];
@@ -33,15 +35,21 @@ function isGrupo(chatId) {
 }
 
 function senderPermitido(senderId) {
-  const owner = onlyDigits(process.env.OWNER_NUMBER);
-  if (!owner) return false;
+  const senderCompleto = limparId(senderId);
+  const senderNumeros = onlyDigits(senderId);
 
-  const possiveisOwners = normalizarNumeroBR(owner);
-  const possiveisSenders = normalizarNumeroBR(senderId);
+  const ownerId = limparId(process.env.OWNER_ID || process.env.OWNER_LID);
+  if (ownerId && senderCompleto === ownerId) return true;
+
+  const ownerNumber = onlyDigits(process.env.OWNER_NUMBER);
+  if (!ownerNumber) return false;
+
+  const possiveisOwners = normalizarNumeroBR(ownerNumber);
+  const possiveisSenders = normalizarNumeroBR(senderNumeros);
 
   return possiveisSenders.some((sender) => {
-    return possiveisOwners.some((ownerNumber) => {
-      return sender.includes(ownerNumber) || ownerNumber.includes(sender);
+    return possiveisOwners.some((owner) => {
+      return sender.includes(owner) || owner.includes(sender);
     });
   });
 }
@@ -49,10 +57,7 @@ function senderPermitido(senderId) {
 function chatPermitido(chatId, senderId, msg) {
   const grupoPermitido = process.env.ALLOWED_GROUP_ID;
 
-  // Quando o bot está conectado no mesmo WhatsApp do dono,
-  // as mensagens enviadas pelo dono aparecem como fromMe.
   if (msg?.key?.fromMe) return true;
-
   if (senderPermitido(senderId)) return true;
 
   if (grupoPermitido) {
@@ -67,11 +72,12 @@ function chatPermitido(chatId, senderId, msg) {
 }
 
 async function responder(sock, msg, texto) {
-  await sock.sendMessage(
-    msg.key.remoteJid,
-    { text: texto },
-    { quoted: msg }
-  );
+  try {
+    await sock.sendMessage(msg.key.remoteJid, { text: texto }, { quoted: msg });
+  } catch (error) {
+    console.error('Erro ao responder com quote, tentando sem quote:', error?.message || error);
+    await sock.sendMessage(msg.key.remoteJid, { text: texto });
+  }
 }
 
 function menu() {
@@ -151,7 +157,8 @@ async function handleCommand(sock, msg) {
     comando,
     chatId,
     senderId,
-    fromMe: Boolean(msg.key.fromMe)
+    fromMe: Boolean(msg.key.fromMe),
+    permitido: chatPermitido(chatId, senderId, msg)
   });
 
   try {
@@ -176,8 +183,15 @@ ${senderId}
 Seu número detectado:
 ${onlyDigits(senderId)}
 
-Para liberar seus comandos no privado, coloque no Back4App:
-OWNER_NUMBER=${onlyDigits(senderId)}`);
+Se aparecer @lid, coloque no Back4App:
+OWNER_ID=${senderId}
+
+Mantenha também:
+OWNER_NUMBER=${process.env.OWNER_NUMBER || 'seu_numero_com_55'}`);
+    }
+
+    if (comando === 'naldo') {
+      return responder(sock, msg, textoNaldo());
     }
 
     if (!chatPermitido(chatId, senderId, msg)) {
@@ -187,10 +201,6 @@ OWNER_NUMBER=${onlyDigits(senderId)}`);
 
     if (comando === 'menu' || comando === 'ajuda') {
       return responder(sock, msg, menu());
-    }
-
-    if (comando === 'naldo') {
-      return responder(sock, msg, textoNaldo());
     }
 
     if (comando === 'cadastrar') {
