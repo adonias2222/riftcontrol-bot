@@ -97,7 +97,9 @@ function isSessionFailure(errorText, statusCode) {
     texto.includes('key used already') ||
     texto.includes('failed to decrypt') ||
     texto.includes('no session') ||
-    texto.includes('decrypt')
+    texto.includes('decrypt') ||
+    texto.includes('conflict') ||
+    texto.includes('restart required')
   );
 }
 
@@ -665,6 +667,40 @@ app.get('/reset-session', async (req, res) => {
           <h1>❌ Erro ao limpar sessão</h1>
           <pre>${escapeHtml(lastError)}</pre>
         `
+      )
+    );
+  }
+});
+
+app.get('/clear-bad-session', async (req, res) => {
+  if (!keyOk(req)) return accessDenied(res);
+
+  try {
+    await clearWhatsappSession('bad-mac-manual');
+
+    setTimeout(connectToWhatsApp, 3000);
+
+    return res.send(
+      page(
+        'Sessão corrompida limpa',
+        \`
+          <h1>✅ Sessão corrompida limpa!</h1>
+          <p>Os dados de criptografia foram removidos do Supabase.</p>
+          <p>O bot vai reconectar em instantes — use <strong>/qr</strong> para escanear o QR Code novamente.</p>
+          <a href="/">Voltar</a>
+        \`
+      )
+    );
+  } catch (error) {
+    lastError = error?.stack || String(error);
+
+    return res.status(500).send(
+      page(
+        'Erro',
+        \`
+          <h1>❌ Erro ao limpar sessão</h1>
+          <pre>\${escapeHtml(lastError)}</pre>
+        \`
       )
     );
   }
