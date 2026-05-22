@@ -12,7 +12,7 @@ const INSTANCE_ID = `${os.hostname()}-${process.pid}-${Math.random().toString(36
 
 const LOCK_ID = '__runtime_lock';
 const LOCK_TTL_MS = 90_000;
-const AUTO_RESET_SESSION = String(process.env.AUTO_RESET_SESSION || 'false').toLowerCase() === 'true';
+const AUTO_RESET_SESSION = String(process.env.AUTO_RESET_SESSION || 'true').toLowerCase() === 'true';
 
 let currentQr = null;
 let currentSock = null;
@@ -426,7 +426,7 @@ app.get('/', (req, res) => {
 
         <div class="box" style="margin-bottom:18px">
           <p class="ok"><strong>Modo atual:</strong> preservando sessão do WhatsApp. O bot não apaga o login automaticamente.</p>
-          <p class="muted">AUTO_RESET_SESSION=${AUTO_RESET_SESSION ? 'true' : 'false'}. Para não precisar reconectar, mantenha como <strong>false</strong>.</p>
+          <p class="muted">AUTO_RESET_SESSION=${AUTO_RESET_SESSION ? 'true' : 'false'}. Com <strong>true</strong>, o bot se recupera sozinho de sessão corrompida e reconecta automaticamente.</p>
           <p class="warn"><strong>Importante:</strong> deixe apenas uma instância ativa. Duas instâncias usando a mesma sessão quebram a criptografia do WhatsApp.</p>
         </div>
 
