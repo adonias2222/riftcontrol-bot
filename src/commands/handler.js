@@ -10,6 +10,24 @@ function onlyDigits(value) {
   return String(value || '').replace(/\D/g, '');
 }
 
+function normalizarNumeroBR(numero) {
+  const n = onlyDigits(numero);
+
+  // Formato BR com DDI 55 + DDD + 9 dígitos. Ex: 5598991748767
+  // Algumas sessões do WhatsApp podem aparecer sem o 9 depois do DDD. Ex: 559891748767
+  if (n.startsWith('55') && n.length === 13) {
+    const semNonoDigito = n.slice(0, 4) + n.slice(5);
+    return [n, semNonoDigito];
+  }
+
+  if (n.startsWith('55') && n.length === 12) {
+    const comNonoDigito = n.slice(0, 4) + '9' + n.slice(4);
+    return [n, comNonoDigito];
+  }
+
+  return [n];
+}
+
 function isGrupo(chatId) {
   return String(chatId || '').endsWith('@g.us');
 }
@@ -18,12 +36,22 @@ function senderPermitido(senderId) {
   const owner = onlyDigits(process.env.OWNER_NUMBER);
   if (!owner) return false;
 
-  const sender = onlyDigits(senderId);
-  return sender.includes(owner) || owner.includes(sender);
+  const possiveisOwners = normalizarNumeroBR(owner);
+  const possiveisSenders = normalizarNumeroBR(senderId);
+
+  return possiveisSenders.some((sender) => {
+    return possiveisOwners.some((ownerNumber) => {
+      return sender.includes(ownerNumber) || ownerNumber.includes(sender);
+    });
+  });
 }
 
-function chatPermitido(chatId, senderId) {
+function chatPermitido(chatId, senderId, msg) {
   const grupoPermitido = process.env.ALLOWED_GROUP_ID;
+
+  // Quando o bot está conectado no mesmo WhatsApp do dono,
+  // as mensagens enviadas pelo dono aparecem como fromMe.
+  if (msg?.key?.fromMe) return true;
 
   if (senderPermitido(senderId)) return true;
 
@@ -119,6 +147,13 @@ async function handleCommand(sock, msg) {
   const comando = partes.shift().replace('!', '').toLowerCase();
   const args = partes;
 
+  console.log('Comando recebido:', {
+    comando,
+    chatId,
+    senderId,
+    fromMe: Boolean(msg.key.fromMe)
+  });
+
   try {
     if (comando === 'idgrupo' || comando === 'grupoid') {
       if (!isGrupo(chatId)) {
@@ -145,7 +180,8 @@ Para liberar seus comandos no privado, coloque no Back4App:
 OWNER_NUMBER=${onlyDigits(senderId)}`);
     }
 
-    if (!chatPermitido(chatId, senderId)) {
+    if (!chatPermitido(chatId, senderId, msg)) {
+      console.log('Comando ignorado por permissão:', { comando, chatId, senderId });
       return;
     }
 
