@@ -1,4 +1,4 @@
-const WebSocket = require('ws');
+const ws = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
 const url = process.env.SUPABASE_URL;
@@ -11,10 +11,16 @@ if (!url || !serviceRoleKey) {
 const supabase = createClient(url, serviceRoleKey, {
   auth: {
     persistSession: false,
-    autoRefreshToken: false
+    autoRefreshToken: false,
+    detectSessionInUrl: false
   },
   realtime: {
-    WebSocket
+    transport: ws
+  },
+  global: {
+    headers: {
+      'X-Client-Info': 'riftcontrol-bot'
+    }
   }
 });
 
