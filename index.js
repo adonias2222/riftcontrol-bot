@@ -15,6 +15,7 @@ let botModules = null;
 let lastError = null;
 let lastPairingCode = null;
 let lastPairingGeneratedAt = null;
+let autoResetInProgress = false;
 let startedAt = new Date().toISOString();
 
 app.use((req, res, next) => {
@@ -52,6 +53,11 @@ function onlyDigits(value) {
 function keyOk(req) {
   const senha = process.env.QR_PASSWORD;
   return !senha || req.query.key === senha || req.body?.key === senha;
+}
+
+function isConnectionFailure(errorText) {
+  const texto = String(errorText || '').toLowerCase();
+  return texto.includes('connection failure') || texto.includes('bad session') || texto.includes('logged out');
 }
 
 function loadBotModules() {
@@ -127,35 +133,80 @@ function accessDenied(res) {
   `));
 }
 
+async function clearWhatsappSession(reason = 'manual') {
+  if (autoResetInProgress) return;
+  autoResetInProgress = true;
+
+  try {
+    connectionStatus = `limpando sessão (${reason})`;
+
+    try {
+      if (currentSock?.logout) await currentSock.logout();
+    } catch (error) {
+      console.log('Logout ignorado:', error?.message || error);
+    }
+
+    try {
+      if (currentSock?.end) currentSock.end(new Error(`Sessão resetada: ${reason}`));
+    } catch (error) {
+      console.log('End ignorado:', error?.message || error);
+    }
+
+    currentSock = null;
+    currentQr = null;
+    lastPairingCode = null;
+    lastPairingGeneratedAt = null;
+
+    const supabase = require('./src/database/supabase');
+    const { error } = await supabase
+      .from('bot_auth')
+      .delete()
+      .not('id', 'is', null);
+
+    if (error) throw error;
+
+    connectionStatus = 'sessão limpa, aguardando novo QR';
+  } catch (error) {
+    lastError = error?.stack || String(error);
+    connectionStatus = 'erro ao limpar sessão';
+  } finally {
+    autoResetInProgress = false;
+  }
+}
+
 app.get('/', (req, res) => {
   res.send(page(BOT_NAME, `
     <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
     <p>Status: <strong class="status">${escapeHtml(connectionStatus)}</strong></p>
 
+    <div class="box" style="margin-bottom:18px">
+      <p class="warn"><strong>Recomendado:</strong> conecte pelo QR Code. O código de pareamento pode expirar rápido em hospedagem por container.</p>
+    </div>
+
     <div class="grid">
       <div class="box">
-        <h2>Conectar por código</h2>
-        <p class="muted">Use esse método só se for digitar o código imediatamente. O código expira rápido e não pode ser reutilizado.</p>
-        <form action="/pairing" method="GET">
+        <h2>Conectar por QR Code</h2>
+        <p class="muted">Método mais estável.</p>
+        <form action="/qr" method="GET">
           <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
-          <input name="phone" type="tel" inputmode="numeric" placeholder="Número com DDI e DDD. Ex: 5598999999999" required />
-          <button class="secondary" type="submit">Gerar código novo</button>
+          <button type="submit">Abrir QR Code</button>
         </form>
       </div>
 
       <div class="box">
-        <h2>Conectar por QR Code</h2>
-        <p class="muted">Método mais recomendado. Funciona melhor que o código em servidores.</p>
-        <form action="/qr" method="GET">
+        <h2>Conectar por código</h2>
+        <p class="muted">Use só se for digitar imediatamente. Exemplo de número: <strong>5598999999999</strong>.</p>
+        <form action="/pairing" method="GET">
           <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
-          <button type="submit">Abrir QR Code</button>
+          <input name="phone" type="tel" inputmode="numeric" placeholder="Número com DDI e DDD" required />
+          <button class="secondary" type="submit">Gerar código novo</button>
         </form>
       </div>
     </div>
 
     <div class="box" style="margin-top:18px">
       <h2>Resetar sessão</h2>
-      <p class="muted">Use isso se o código aparecer como expirado toda hora, se o QR não conectar, ou se a sessão do WhatsApp ficou bugada.</p>
+      <p class="muted">Use se aparecer “Connection Failure”, “código expirado” ou se o QR não conectar.</p>
       <form action="/reset-session" method="GET">
         <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
         <button class="danger" type="submit">Limpar sessão do WhatsApp</button>
@@ -167,13 +218,8 @@ app.get('/', (req, res) => {
   `));
 });
 
-app.get('/health', (req, res) => {
-  res.status(200).send('ok');
-});
-
-app.get('/favicon.ico', (req, res) => {
-  res.status(204).end();
-});
+app.get('/health', (req, res) => res.status(200).send('ok'));
+app.get('/favicon.ico', (req, res) => res.status(204).end());
 
 app.get('/status', (req, res) => {
   res.json({
@@ -205,7 +251,7 @@ app.get('/qr', async (req, res) => {
       <p>Nenhum QR Code disponível agora. A página atualiza automaticamente a cada 5 segundos.</p>
       <p class="muted">Se ficar assim por muito tempo, volte e use “Limpar sessão do WhatsApp”.</p>
       ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
-    `, 'body { text-align: center; } meta{}').replace('</head>', '<meta http-equiv="refresh" content="5" /></head>'));
+    `, 'body { text-align: center; }').replace('</head>', '<meta http-equiv="refresh" content="5" /></head>'));
   }
 
   const qrImage = await QRCode.toDataURL(currentQr);
@@ -220,7 +266,6 @@ app.get('/qr', async (req, res) => {
 
 app.get('/pairing', async (req, res) => {
   if (!keyOk(req)) return accessDenied(res);
-
   const phone = onlyDigits(req.query.phone);
 
   if (!phone || phone.length < 10) {
@@ -266,14 +311,8 @@ app.get('/pairing', async (req, res) => {
       <h1>🔐 Código de pareamento</h1>
       <p>Digite este código imediatamente no WhatsApp do número <strong>${escapeHtml(phone)}</strong>:</p>
       <pre class="code">${escapeHtml(code)}</pre>
-      <p class="warn"><strong>Importante:</strong> esse código expira rápido. Se aparecer “expirado”, volte e gere outro código novo.</p>
-      <ol class="muted">
-        <li>Abra o WhatsApp no celular do número do bot.</li>
-        <li>Vá em <strong>Dispositivos conectados</strong>.</li>
-        <li>Escolha a opção de conectar com número/código, quando aparecer.</li>
-        <li>Digite o código acima imediatamente.</li>
-      </ol>
-      <p class="muted">Se continuar expirando na hora, volte para a página inicial e clique em <strong>Limpar sessão do WhatsApp</strong>. Depois tente pelo QR Code.</p>
+      <p class="warn"><strong>Importante:</strong> esse código expira rápido. Se aparecer “expirado”, gere outro ou use QR Code.</p>
+      <p class="muted">Se continuar expirando, clique em <strong>Limpar sessão do WhatsApp</strong> e use o QR Code.</p>
       <a href="/status">Ver status</a>
     `));
   } catch (error) {
@@ -289,57 +328,17 @@ app.get('/pairing', async (req, res) => {
 
 app.get('/reset-session', async (req, res) => {
   if (!keyOk(req)) return accessDenied(res);
-
-  try {
-    connectionStatus = 'limpando sessão';
-    lastError = null;
-
-    try {
-      if (currentSock?.logout) await currentSock.logout();
-    } catch (error) {
-      console.log('Logout ignorado:', error?.message || error);
-    }
-
-    try {
-      if (currentSock?.end) currentSock.end(new Error('Sessão resetada pelo painel'));
-    } catch (error) {
-      console.log('End ignorado:', error?.message || error);
-    }
-
-    currentSock = null;
-    currentQr = null;
-    lastPairingCode = null;
-    lastPairingGeneratedAt = null;
-
-    const supabase = require('./src/database/supabase');
-    const { error } = await supabase
-      .from('bot_auth')
-      .delete()
-      .not('id', 'is', null);
-
-    if (error) throw error;
-
-    connectionStatus = 'sessão limpa, reconectando';
-    setTimeout(() => {
-      reconnecting = false;
-      connectToWhatsApp();
-    }, 2000);
-
-    return res.send(page('Sessão limpa', `
-      <h1>✅ Sessão limpa</h1>
-      <p>A sessão antiga do WhatsApp foi removida do Supabase.</p>
-      <p>Aguarde alguns segundos e tente conectar novamente. Recomendo usar o <strong>QR Code</strong>.</p>
-      <a href="/">Voltar</a>
-    `));
-  } catch (error) {
-    lastError = error?.stack || String(error);
-    connectionStatus = 'erro ao limpar sessão';
-    return res.status(500).send(page('Erro ao limpar sessão', `
-      <h1>❌ Erro ao limpar sessão</h1>
-      <pre>${escapeHtml(lastError)}</pre>
-      <a href="/">Voltar</a>
-    `));
-  }
+  await clearWhatsappSession('manual');
+  setTimeout(() => {
+    reconnecting = false;
+    connectToWhatsApp();
+  }, 2000);
+  return res.send(page('Sessão limpa', `
+    <h1>✅ Sessão limpa</h1>
+    <p>A sessão antiga do WhatsApp foi removida do Supabase.</p>
+    <p>Aguarde alguns segundos e use o <strong>QR Code</strong>.</p>
+    <a href="/">Voltar</a>
+  `));
 });
 
 app.get('/pair', (req, res) => {
@@ -349,11 +348,7 @@ app.get('/pair', (req, res) => {
 
 app.get('/:key', (req, res) => {
   const key = req.params.key;
-
-  if (!key || key.includes('.')) {
-    return res.status(404).send('Página não encontrada. Use / ou /qr?key=SUA_SENHA');
-  }
-
+  if (!key || key.includes('.')) return res.status(404).send('Página não encontrada. Use / ou /qr?key=SUA_SENHA');
   return res.redirect(`/qr?key=${encodeURIComponent(key)}`);
 });
 
@@ -365,20 +360,12 @@ async function connectToWhatsApp() {
     if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
       connectionStatus = 'aguardando variáveis do Supabase';
       lastError = 'Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY nas variáveis de ambiente do Back4App.';
-      console.error(lastError);
       reconnecting = false;
       return;
     }
 
     connectionStatus = 'carregando módulos';
-    const {
-      pino,
-      makeWASocket,
-      DisconnectReason,
-      fetchLatestBaileysVersion,
-      useSupabaseAuthState,
-      handleCommand
-    } = loadBotModules();
+    const { pino, makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useSupabaseAuthState, handleCommand } = loadBotModules();
 
     connectionStatus = 'conectando';
     lastError = null;
@@ -391,16 +378,19 @@ async function connectToWhatsApp() {
       auth: state,
       printQRInTerminal: false,
       logger: pino({ level: process.env.LOG_LEVEL || 'silent' }),
-      browser: [BOT_NAME, 'Chrome', '1.0.0']
+      browser: [BOT_NAME, 'Chrome', '1.0.0'],
+      connectTimeoutMs: 60_000,
+      keepAliveIntervalMs: 25_000,
+      retryRequestDelayMs: 2_000,
+      markOnlineOnConnect: false,
+      syncFullHistory: false
     });
 
     currentSock = sock;
-
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (type !== 'notify') return;
-
       for (const msg of messages) {
         try {
           if (!msg.message) continue;
@@ -418,8 +408,7 @@ async function connectToWhatsApp() {
 
       if (qr) {
         currentQr = qr;
-        connectionStatus = 'aguardando QR Code ou código';
-        console.log('QR Code gerado. Também é possível gerar código de pareamento na página inicial.');
+        connectionStatus = 'aguardando QR Code';
       }
 
       if (connection === 'open') {
@@ -434,24 +423,33 @@ async function connectToWhatsApp() {
       if (connection === 'close') {
         currentSock = null;
         const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const errorText = lastDisconnect?.error?.stack || lastDisconnect?.error?.message || String(lastDisconnect?.error || '');
         const deslogado = statusCode === DisconnectReason.loggedOut;
+        const falhaSessao = deslogado || isConnectionFailure(errorText);
 
-        connectionStatus = deslogado ? 'deslogado' : 'reconectando';
-        lastError = lastDisconnect?.error?.stack || lastDisconnect?.error?.message || `Conexão fechada. Status: ${statusCode}`;
-        console.log('Conexão fechada.', { statusCode, deslogado });
+        lastError = errorText || `Conexão fechada. Status: ${statusCode}`;
+        console.log('Conexão fechada.', { statusCode, deslogado, falhaSessao });
 
-        if (!deslogado) {
-          setTimeout(() => {
-            reconnecting = false;
-            connectToWhatsApp();
-          }, 5000);
+        if (falhaSessao) {
+          await clearWhatsappSession('falha de conexão');
         }
+
+        connectionStatus = falhaSessao ? 'sessão limpa, gere novo QR' : 'reconectando';
+
+        setTimeout(() => {
+          reconnecting = false;
+          connectToWhatsApp();
+        }, falhaSessao ? 8000 : 5000);
       }
     });
   } catch (error) {
     lastError = error?.stack || String(error);
     console.error('Erro ao conectar:', error);
     connectionStatus = 'erro ao conectar';
+
+    if (isConnectionFailure(lastError)) {
+      await clearWhatsappSession('erro ao conectar');
+    }
 
     setTimeout(() => {
       reconnecting = false;
