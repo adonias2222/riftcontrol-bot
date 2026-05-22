@@ -1,3 +1,4 @@
+const WebSocket = require('ws');
 const { createClient } = require('@supabase/supabase-js');
 
 const url = process.env.SUPABASE_URL;
@@ -11,6 +12,9 @@ const supabase = createClient(url, serviceRoleKey, {
   auth: {
     persistSession: false,
     autoRefreshToken: false
+  },
+  realtime: {
+    WebSocket
   }
 });
 
