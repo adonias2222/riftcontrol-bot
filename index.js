@@ -38,8 +38,6 @@ function escapeHtml(value) {
 function loadBotModules() {
   if (botModules) return botModules;
 
-  // Carregar os módulos do bot só depois do servidor HTTP subir.
-  // Assim, se Supabase/Baileys der erro, o Back4App ainda consegue validar a porta.
   const WebSocket = require('ws');
   global.WebSocket = WebSocket;
   globalThis.WebSocket = WebSocket;
@@ -64,28 +62,44 @@ function loadBotModules() {
   return botModules;
 }
 
+function baseStyles() {
+  return `
+    body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; }
+    .card { max-width: 680px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; box-shadow: 0 18px 55px rgba(0,0,0,.35); }
+    h1 { margin-top: 0; }
+    input { width: 100%; box-sizing: border-box; padding: 14px; border-radius: 12px; border: 1px solid #334155; background: #050816; color: white; font-size: 16px; margin: 10px 0; }
+    button { width: 100%; padding: 14px; border: 0; border-radius: 12px; background: #38bdf8; color: #020617; font-weight: 700; font-size: 16px; cursor: pointer; }
+    a { color: #7dd3fc; }
+    code, pre { background: #050816; padding: 4px 8px; border-radius: 8px; }
+    pre { white-space: pre-wrap; overflow-wrap: break-word; padding: 12px; color: #fecaca; }
+    .muted { color: #cbd5e1; font-size: 14px; }
+    .status { display: inline-block; padding: 6px 10px; background: #0f172a; border-radius: 999px; }
+  `;
+}
+
 app.get('/', (req, res) => {
   res.send(`
     <html>
       <head>
         <title>${escapeHtml(BOT_NAME)}</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-          body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; }
-          .card { max-width: 680px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
-          a { color: #7dd3fc; }
-          code, pre { background: #050816; padding: 4px 8px; border-radius: 8px; }
-          pre { white-space: pre-wrap; overflow-wrap: break-word; padding: 12px; color: #fecaca; }
-        </style>
+        <style>${baseStyles()}</style>
       </head>
       <body>
         <div class="card">
           <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
-          <p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p>
-          <p>Para parear o WhatsApp, abra:</p>
-          <p><code>/qr?key=SUA_SENHA</code></p>
-          <p>Para ver diagnóstico:</p>
-          <p><code>/status</code></p>
+          <p>Status: <strong class="status">${escapeHtml(connectionStatus)}</strong></p>
+
+          <h2>Entrar no QR Code</h2>
+          <p class="muted">Digite a senha configurada em <strong>QR_PASSWORD</strong>. Ao enviar, a página abre o QR automaticamente.</p>
+
+          <form action="/qr" method="GET">
+            <input name="key" type="password" placeholder="Digite a senha do QR" autocomplete="current-password" required />
+            <button type="submit">Abrir QR Code</button>
+          </form>
+
+          <p class="muted">Também funciona usando: <code>/qr?key=SUA_SENHA</code></p>
+          <p class="muted">Diagnóstico: <a href="/status">/status</a></p>
           ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
         </div>
       </body>
@@ -95,6 +109,10 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.status(200).send('ok');
+});
+
+app.get('/favicon.ico', (req, res) => {
+  res.status(204).end();
 });
 
 app.get('/status', (req, res) => {
@@ -118,7 +136,22 @@ app.get('/qr', async (req, res) => {
   const senha = process.env.QR_PASSWORD;
 
   if (senha && req.query.key !== senha) {
-    return res.status(401).send('Acesso negado. Informe a senha em /qr?key=SUA_SENHA');
+    return res.status(401).send(`
+      <html>
+        <head>
+          <title>Acesso negado - ${escapeHtml(BOT_NAME)}</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <style>${baseStyles()}</style>
+        </head>
+        <body>
+          <div class="card">
+            <h1>🔒 Acesso negado</h1>
+            <p>A senha informada está errada ou não foi enviada.</p>
+            <a href="/">Voltar para a página inicial</a>
+          </div>
+        </body>
+      </html>
+    `);
   }
 
   if (!currentQr) {
@@ -128,11 +161,7 @@ app.get('/qr', async (req, res) => {
           <title>QR Code - ${escapeHtml(BOT_NAME)}</title>
           <meta name="viewport" content="width=device-width, initial-scale=1" />
           <meta http-equiv="refresh" content="5" />
-          <style>
-            body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; text-align: center; }
-            .card { max-width: 560px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
-            pre { background: #050816; padding: 12px; border-radius: 12px; color: #fecaca; white-space: pre-wrap; overflow-wrap: break-word; text-align: left; }
-          </style>
+          <style>${baseStyles()} body { text-align: center; }</style>
         </head>
         <body>
           <div class="card">
@@ -153,11 +182,7 @@ app.get('/qr', async (req, res) => {
       <head>
         <title>QR Code - ${escapeHtml(BOT_NAME)}</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-          body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; text-align: center; }
-          .card { max-width: 560px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
-          img { width: 300px; max-width: 90%; background: white; padding: 12px; border-radius: 12px; }
-        </style>
+        <style>${baseStyles()} body { text-align: center; } img { width: 300px; max-width: 90%; background: white; padding: 12px; border-radius: 12px; }</style>
       </head>
       <body>
         <div class="card">
@@ -169,6 +194,17 @@ app.get('/qr', async (req, res) => {
       </body>
     </html>
   `);
+});
+
+// Atalho opcional: se abrir /SUA_SENHA, redireciona para /qr?key=SUA_SENHA.
+app.get('/:key', (req, res) => {
+  const key = req.params.key;
+
+  if (!key || key.includes('.')) {
+    return res.status(404).send('Página não encontrada. Use / ou /qr?key=SUA_SENHA');
+  }
+
+  return res.redirect(`/qr?key=${encodeURIComponent(key)}`);
 });
 
 async function connectToWhatsApp() {
@@ -231,7 +267,7 @@ async function connectToWhatsApp() {
       if (qr) {
         currentQr = qr;
         connectionStatus = 'aguardando QR Code';
-        console.log('QR Code gerado. Abra /qr?key=SUA_SENHA no navegador.');
+        console.log('QR Code gerado. Abra a URL principal e digite a senha.');
       }
 
       if (connection === 'open') {
