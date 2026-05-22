@@ -9,6 +9,7 @@ const BOT_NAME = process.env.BOT_NAME || 'RiftControl';
 
 let currentQr = null;
 let currentSock = null;
+let currentSocketId = 0;
 let connectionStatus = 'iniciando';
 let reconnecting = false;
 let botModules = null;
@@ -55,9 +56,22 @@ function keyOk(req) {
   return !senha || req.query.key === senha || req.body?.key === senha;
 }
 
-function isConnectionFailure(errorText) {
+function isSessionFailure(errorText, statusCode) {
   const texto = String(errorText || '').toLowerCase();
-  return texto.includes('connection failure') || texto.includes('bad session') || texto.includes('logged out');
+
+  return (
+    statusCode === 440 ||
+    statusCode === 401 ||
+    texto.includes('connection failure') ||
+    texto.includes('bad session') ||
+    texto.includes('logged out') ||
+    texto.includes('bad mac') ||
+    texto.includes('messagecountererror') ||
+    texto.includes('key used already') ||
+    texto.includes('failed to decrypt') ||
+    texto.includes('no session') ||
+    texto.includes('decrypt')
+  );
 }
 
 function loadBotModules() {
@@ -141,12 +155,6 @@ async function clearWhatsappSession(reason = 'manual') {
     connectionStatus = `limpando sessão (${reason})`;
 
     try {
-      if (currentSock?.logout) await currentSock.logout();
-    } catch (error) {
-      console.log('Logout ignorado:', error?.message || error);
-    }
-
-    try {
       if (currentSock?.end) currentSock.end(new Error(`Sessão resetada: ${reason}`));
     } catch (error) {
       console.log('End ignorado:', error?.message || error);
@@ -156,6 +164,7 @@ async function clearWhatsappSession(reason = 'manual') {
     currentQr = null;
     lastPairingCode = null;
     lastPairingGeneratedAt = null;
+    currentSocketId += 1;
 
     const supabase = require('./src/database/supabase');
     const { error } = await supabase
@@ -206,7 +215,7 @@ app.get('/', (req, res) => {
 
     <div class="box" style="margin-top:18px">
       <h2>Resetar sessão</h2>
-      <p class="muted">Use se aparecer “Connection Failure”, “código expirado” ou se o QR não conectar.</p>
+      <p class="muted">Use se aparecer “Connection Failure”, “Bad MAC”, “MessageCounterError”, “código expirado” ou se o QR não conectar.</p>
       <form action="/reset-session" method="GET">
         <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
         <button class="danger" type="submit">Limpar sessão do WhatsApp</button>
@@ -228,6 +237,7 @@ app.get('/status', (req, res) => {
     status: connectionStatus,
     qrDisponivel: Boolean(currentQr),
     socketDisponivel: Boolean(currentSock),
+    socketId: currentSocketId,
     pairingCodeDisponivel: Boolean(lastPairingCode),
     lastPairingGeneratedAt,
     porta: PORT,
@@ -353,7 +363,7 @@ app.get('/:key', (req, res) => {
 });
 
 async function connectToWhatsApp() {
-  if (reconnecting) return;
+  if (reconnecting || currentSock) return;
   reconnecting = true;
 
   try {
@@ -372,6 +382,8 @@ async function connectToWhatsApp() {
 
     const { state, saveCreds } = await useSupabaseAuthState();
     const { version } = await fetchLatestBaileysVersion();
+    const socketId = currentSocketId + 1;
+    currentSocketId = socketId;
 
     const sock = makeWASocket({
       version,
@@ -387,10 +399,14 @@ async function connectToWhatsApp() {
     });
 
     currentSock = sock;
+    reconnecting = false;
+
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (socketId !== currentSocketId) return;
       if (type !== 'notify') return;
+
       for (const msg of messages) {
         try {
           if (!msg.message) continue;
@@ -404,6 +420,8 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('connection.update', async (update) => {
+      if (socketId !== currentSocketId) return;
+
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -425,13 +443,13 @@ async function connectToWhatsApp() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errorText = lastDisconnect?.error?.stack || lastDisconnect?.error?.message || String(lastDisconnect?.error || '');
         const deslogado = statusCode === DisconnectReason.loggedOut;
-        const falhaSessao = deslogado || isConnectionFailure(errorText);
+        const falhaSessao = deslogado || isSessionFailure(errorText, statusCode);
 
         lastError = errorText || `Conexão fechada. Status: ${statusCode}`;
         console.log('Conexão fechada.', { statusCode, deslogado, falhaSessao });
 
         if (falhaSessao) {
-          await clearWhatsappSession('falha de conexão');
+          await clearWhatsappSession(`sessão inválida ${statusCode || ''}`.trim());
         }
 
         connectionStatus = falhaSessao ? 'sessão limpa, gere novo QR' : 'reconectando';
@@ -439,24 +457,21 @@ async function connectToWhatsApp() {
         setTimeout(() => {
           reconnecting = false;
           connectToWhatsApp();
-        }, falhaSessao ? 8000 : 5000);
+        }, falhaSessao ? 12000 : 6000);
       }
     });
   } catch (error) {
+    currentSock = null;
+    reconnecting = false;
     lastError = error?.stack || String(error);
     console.error('Erro ao conectar:', error);
     connectionStatus = 'erro ao conectar';
 
-    if (isConnectionFailure(lastError)) {
+    if (isSessionFailure(lastError)) {
       await clearWhatsappSession('erro ao conectar');
     }
 
-    setTimeout(() => {
-      reconnecting = false;
-      connectToWhatsApp();
-    }, 10000);
-  } finally {
-    reconnecting = false;
+    setTimeout(connectToWhatsApp, 10000);
   }
 }
 
