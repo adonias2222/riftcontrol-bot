@@ -2,55 +2,115 @@ require('dotenv').config();
 
 const express = require('express');
 const QRCode = require('qrcode');
-const pino = require('pino');
-const makeWASocket = require('@whiskeysockets/baileys').default;
-const {
-  DisconnectReason,
-  fetchLatestBaileysVersion
-} = require('@whiskeysockets/baileys');
-
-const useSupabaseAuthState = require('./src/auth/supabaseAuthState');
-const handleCommand = require('./src/commands/handler');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
 const BOT_NAME = process.env.BOT_NAME || 'RiftControl';
 
 let currentQr = null;
 let connectionStatus = 'iniciando';
 let reconnecting = false;
+let botModules = null;
+let lastError = null;
+let startedAt = new Date().toISOString();
+
+process.on('uncaughtException', (error) => {
+  lastError = error?.stack || String(error);
+  connectionStatus = 'erro interno';
+  console.error('uncaughtException:', error);
+});
+
+process.on('unhandledRejection', (reason) => {
+  lastError = reason?.stack || String(reason);
+  connectionStatus = 'erro interno';
+  console.error('unhandledRejection:', reason);
+});
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+}
+
+function loadBotModules() {
+  if (botModules) return botModules;
+
+  // Carregar os módulos do bot só depois do servidor HTTP subir.
+  // Assim, se Supabase/Baileys der erro, o Back4App ainda consegue validar a porta.
+  const WebSocket = require('ws');
+  global.WebSocket = WebSocket;
+  globalThis.WebSocket = WebSocket;
+
+  const pino = require('pino');
+  const baileys = require('@whiskeysockets/baileys');
+  const makeWASocket = baileys.default || baileys.makeWASocket;
+  const { DisconnectReason, fetchLatestBaileysVersion } = baileys;
+
+  const useSupabaseAuthState = require('./src/auth/supabaseAuthState');
+  const handleCommand = require('./src/commands/handler');
+
+  botModules = {
+    pino,
+    makeWASocket,
+    DisconnectReason,
+    fetchLatestBaileysVersion,
+    useSupabaseAuthState,
+    handleCommand
+  };
+
+  return botModules;
+}
 
 app.get('/', (req, res) => {
   res.send(`
     <html>
       <head>
-        <title>${BOT_NAME}</title>
+        <title>${escapeHtml(BOT_NAME)}</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
           body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; }
-          .card { max-width: 620px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
+          .card { max-width: 680px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
           a { color: #7dd3fc; }
-          code { background: #050816; padding: 4px 8px; border-radius: 8px; }
+          code, pre { background: #050816; padding: 4px 8px; border-radius: 8px; }
+          pre { white-space: pre-wrap; overflow-wrap: break-word; padding: 12px; color: #fecaca; }
         </style>
       </head>
       <body>
         <div class="card">
-          <h1>⚔️ ${BOT_NAME}</h1>
-          <p>Status: <strong>${connectionStatus}</strong></p>
+          <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
+          <p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p>
           <p>Para parear o WhatsApp, abra:</p>
           <p><code>/qr?key=SUA_SENHA</code></p>
-          <p>Depois teste no grupo: <code>!menu</code></p>
+          <p>Para ver diagnóstico:</p>
+          <p><code>/status</code></p>
+          ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
         </div>
       </body>
     </html>
   `);
 });
 
+app.get('/health', (req, res) => {
+  res.status(200).send('ok');
+});
+
 app.get('/status', (req, res) => {
   res.json({
+    ok: true,
     bot: BOT_NAME,
     status: connectionStatus,
-    qrDisponivel: Boolean(currentQr)
+    qrDisponivel: Boolean(currentQr),
+    porta: PORT,
+    startedAt,
+    env: {
+      SUPABASE_URL: Boolean(process.env.SUPABASE_URL),
+      SUPABASE_SERVICE_ROLE_KEY: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+      QR_PASSWORD: Boolean(process.env.QR_PASSWORD)
+    },
+    lastError
   });
 });
 
@@ -65,18 +125,21 @@ app.get('/qr', async (req, res) => {
     return res.send(`
       <html>
         <head>
+          <title>QR Code - ${escapeHtml(BOT_NAME)}</title>
           <meta name="viewport" content="width=device-width, initial-scale=1" />
+          <meta http-equiv="refresh" content="5" />
           <style>
             body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; text-align: center; }
-            .card { max-width: 520px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
+            .card { max-width: 560px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
+            pre { background: #050816; padding: 12px; border-radius: 12px; color: #fecaca; white-space: pre-wrap; overflow-wrap: break-word; text-align: left; }
           </style>
         </head>
         <body>
           <div class="card">
-            <h1>⚔️ ${BOT_NAME}</h1>
-            <p>Status: <strong>${connectionStatus}</strong></p>
-            <p>Nenhum QR Code disponível agora.</p>
-            <p>Se ainda não conectou, aguarde alguns segundos e atualize a página.</p>
+            <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
+            <p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p>
+            <p>Nenhum QR Code disponível agora. A página atualiza automaticamente a cada 5 segundos.</p>
+            ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
           </div>
         </body>
       </html>
@@ -88,17 +151,17 @@ app.get('/qr', async (req, res) => {
   return res.send(`
     <html>
       <head>
-        <title>QR Code - ${BOT_NAME}</title>
+        <title>QR Code - ${escapeHtml(BOT_NAME)}</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
           body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 30px; text-align: center; }
-          .card { max-width: 520px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
+          .card { max-width: 560px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
           img { width: 300px; max-width: 90%; background: white; padding: 12px; border-radius: 12px; }
         </style>
       </head>
       <body>
         <div class="card">
-          <h1>⚔️ ${BOT_NAME}</h1>
+          <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
           <p>Abra o WhatsApp → Dispositivos conectados → Conectar dispositivo.</p>
           <img src="${qrImage}" alt="QR Code do WhatsApp" />
           <p>Depois de conectar, teste no grupo: <strong>!menu</strong></p>
@@ -113,7 +176,26 @@ async function connectToWhatsApp() {
   reconnecting = true;
 
   try {
+    if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+      connectionStatus = 'aguardando variáveis do Supabase';
+      lastError = 'Configure SUPABASE_URL e SUPABASE_SERVICE_ROLE_KEY nas variáveis de ambiente do Back4App.';
+      console.error(lastError);
+      reconnecting = false;
+      return;
+    }
+
+    connectionStatus = 'carregando módulos';
+    const {
+      pino,
+      makeWASocket,
+      DisconnectReason,
+      fetchLatestBaileysVersion,
+      useSupabaseAuthState,
+      handleCommand
+    } = loadBotModules();
+
     connectionStatus = 'conectando';
+    lastError = null;
 
     const { state, saveCreds } = await useSupabaseAuthState();
     const { version } = await fetchLatestBaileysVersion();
@@ -121,8 +203,8 @@ async function connectToWhatsApp() {
     const sock = makeWASocket({
       version,
       auth: state,
-      printQRInTerminal: true,
-      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+      logger: pino({ level: process.env.LOG_LEVEL || 'silent' }),
       browser: [BOT_NAME, 'Chrome', '1.0.0']
     });
 
@@ -132,10 +214,14 @@ async function connectToWhatsApp() {
       if (type !== 'notify') return;
 
       for (const msg of messages) {
-        if (!msg.message) continue;
-        if (msg.key.fromMe) continue;
-
-        await handleCommand(sock, msg);
+        try {
+          if (!msg.message) continue;
+          if (msg.key.fromMe) continue;
+          await handleCommand(sock, msg);
+        } catch (error) {
+          lastError = error?.stack || String(error);
+          console.error('Erro ao processar mensagem:', error);
+        }
       }
     });
 
@@ -151,6 +237,7 @@ async function connectToWhatsApp() {
       if (connection === 'open') {
         currentQr = null;
         connectionStatus = 'conectado';
+        lastError = null;
         console.log(`${BOT_NAME} conectado ao WhatsApp.`);
       }
 
@@ -159,6 +246,7 @@ async function connectToWhatsApp() {
         const deslogado = statusCode === DisconnectReason.loggedOut;
 
         connectionStatus = deslogado ? 'deslogado' : 'reconectando';
+        lastError = lastDisconnect?.error?.stack || lastDisconnect?.error?.message || `Conexão fechada. Status: ${statusCode}`;
         console.log('Conexão fechada.', { statusCode, deslogado });
 
         if (!deslogado) {
@@ -170,6 +258,7 @@ async function connectToWhatsApp() {
       }
     });
   } catch (error) {
+    lastError = error?.stack || String(error);
     console.error('Erro ao conectar:', error);
     connectionStatus = 'erro ao conectar';
 
@@ -177,12 +266,12 @@ async function connectToWhatsApp() {
       reconnecting = false;
       connectToWhatsApp();
     }, 10000);
+  } finally {
+    reconnecting = false;
   }
-
-  reconnecting = false;
 }
 
-app.listen(PORT, () => {
-  console.log(`${BOT_NAME} rodando na porta ${PORT}`);
-  connectToWhatsApp();
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`${BOT_NAME} servidor HTTP rodando em 0.0.0.0:${PORT}`);
+  setTimeout(connectToWhatsApp, 1500);
 });
