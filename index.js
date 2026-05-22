@@ -1,11 +1,15 @@
 require('dotenv').config();
 
+const os = require('os');
 const express = require('express');
 const QRCode = require('qrcode');
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const BOT_NAME = process.env.BOT_NAME || 'RiftControl';
+const INSTANCE_ID = `${os.hostname()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+const LOCK_ID = '__runtime_lock';
+const LOCK_TTL_MS = 90_000;
 
 let currentQr = null;
 let currentSock = null;
@@ -16,8 +20,10 @@ let botModules = null;
 let lastError = null;
 let lastPairingCode = null;
 let lastPairingGeneratedAt = null;
-let autoResetInProgress = false;
 let startedAt = new Date().toISOString();
+let runtimeLockTimer = null;
+let hasRuntimeLock = false;
+let lastLockInfo = null;
 
 app.use((req, res, next) => {
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
@@ -58,7 +64,6 @@ function keyOk(req) {
 
 function isSessionFailure(errorText, statusCode) {
   const texto = String(errorText || '').toLowerCase();
-
   return (
     statusCode === 440 ||
     statusCode === 401 ||
@@ -74,6 +79,10 @@ function isSessionFailure(errorText, statusCode) {
   );
 }
 
+function getSupabase() {
+  return require('./src/database/supabase');
+}
+
 function loadBotModules() {
   if (botModules) return botModules;
 
@@ -85,20 +94,90 @@ function loadBotModules() {
   const baileys = require('@whiskeysockets/baileys');
   const makeWASocket = baileys.default || baileys.makeWASocket;
   const { DisconnectReason, fetchLatestBaileysVersion } = baileys;
-
   const useSupabaseAuthState = require('./src/auth/supabaseAuthState');
   const handleCommand = require('./src/commands/handler');
 
-  botModules = {
-    pino,
-    makeWASocket,
-    DisconnectReason,
-    fetchLatestBaileysVersion,
-    useSupabaseAuthState,
-    handleCommand
+  botModules = { pino, makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useSupabaseAuthState, handleCommand };
+  return botModules;
+}
+
+async function readRuntimeLock() {
+  const supabase = getSupabase();
+  const { data, error } = await supabase.from('bot_auth').select('value, updated_at').eq('id', LOCK_ID).maybeSingle();
+  if (error) throw error;
+  if (!data?.value) return null;
+
+  try {
+    return JSON.parse(data.value);
+  } catch {
+    return null;
+  }
+}
+
+async function writeRuntimeLock() {
+  const supabase = getSupabase();
+  const value = {
+    owner: INSTANCE_ID,
+    expiresAt: Date.now() + LOCK_TTL_MS,
+    updatedAt: new Date().toISOString()
   };
 
-  return botModules;
+  const { error } = await supabase.from('bot_auth').upsert({
+    id: LOCK_ID,
+    value: JSON.stringify(value),
+    updated_at: new Date().toISOString()
+  }, { onConflict: 'id' });
+
+  if (error) throw error;
+  lastLockInfo = value;
+  hasRuntimeLock = true;
+  return value;
+}
+
+async function acquireRuntimeLock() {
+  const lock = await readRuntimeLock();
+  const now = Date.now();
+
+  if (lock?.owner && lock.owner !== INSTANCE_ID && Number(lock.expiresAt || 0) > now) {
+    lastLockInfo = lock;
+    hasRuntimeLock = false;
+    connectionStatus = 'standby: outra instância está ativa';
+    lastError = `Outra instância está usando a sessão: ${lock.owner}`;
+    return false;
+  }
+
+  await writeRuntimeLock();
+  return true;
+}
+
+function startRuntimeHeartbeat() {
+  clearInterval(runtimeLockTimer);
+  runtimeLockTimer = setInterval(async () => {
+    if (!hasRuntimeLock) return;
+    try {
+      await writeRuntimeLock();
+    } catch (error) {
+      lastError = error?.stack || String(error);
+      console.error('Erro ao renovar runtime lock:', error);
+    }
+  }, 30_000);
+}
+
+async function releaseRuntimeLock() {
+  clearInterval(runtimeLockTimer);
+  runtimeLockTimer = null;
+
+  try {
+    const lock = await readRuntimeLock();
+    if (lock?.owner === INSTANCE_ID) {
+      const supabase = getSupabase();
+      await supabase.from('bot_auth').delete().eq('id', LOCK_ID);
+    }
+  } catch (error) {
+    console.log('Erro ao liberar runtime lock:', error?.message || error);
+  }
+
+  hasRuntimeLock = false;
 }
 
 function baseStyles() {
@@ -118,110 +197,51 @@ function baseStyles() {
     .grid { display: grid; grid-template-columns: 1fr; gap: 18px; }
     .box { background: #0f172a; padding: 16px; border-radius: 16px; border: 1px solid #23314f; }
     .code { font-size: 34px; letter-spacing: 6px; text-align: center; padding: 18px; color: #bbf7d0; }
-    .ok { color: #bbf7d0; }
     .warn { color: #fde68a; }
     @media (min-width: 760px) { .grid { grid-template-columns: 1fr 1fr; } }
   `;
 }
 
 function page(title, body, extraStyle = '') {
-  return `
-    <html>
-      <head>
-        <title>${escapeHtml(title)} - ${escapeHtml(BOT_NAME)}</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>${baseStyles()} ${extraStyle}</style>
-      </head>
-      <body>
-        <div class="card">${body}</div>
-      </body>
-    </html>
-  `;
+  return `<html><head><title>${escapeHtml(title)} - ${escapeHtml(BOT_NAME)}</title><meta name="viewport" content="width=device-width, initial-scale=1" /><style>${baseStyles()} ${extraStyle}</style></head><body><div class="card">${body}</div></body></html>`;
 }
 
 function accessDenied(res) {
-  return res.status(401).send(page('Acesso negado', `
-    <h1>🔒 Acesso negado</h1>
-    <p>A senha informada está errada ou não foi enviada.</p>
-    <a href="/">Voltar para a página inicial</a>
-  `));
+  return res.status(401).send(page('Acesso negado', `<h1>🔒 Acesso negado</h1><p>A senha informada está errada ou não foi enviada.</p><a href="/">Voltar</a>`));
 }
 
 async function clearWhatsappSession(reason = 'manual') {
-  if (autoResetInProgress) return;
-  autoResetInProgress = true;
+  connectionStatus = `limpando sessão (${reason})`;
 
   try {
-    connectionStatus = `limpando sessão (${reason})`;
-
-    try {
-      if (currentSock?.end) currentSock.end(new Error(`Sessão resetada: ${reason}`));
-    } catch (error) {
-      console.log('End ignorado:', error?.message || error);
-    }
-
-    currentSock = null;
-    currentQr = null;
-    lastPairingCode = null;
-    lastPairingGeneratedAt = null;
-    currentSocketId += 1;
-
-    const supabase = require('./src/database/supabase');
-    const { error } = await supabase
-      .from('bot_auth')
-      .delete()
-      .not('id', 'is', null);
-
-    if (error) throw error;
-
-    connectionStatus = 'sessão limpa, aguardando novo QR';
+    if (currentSock?.end) currentSock.end(new Error(`Sessão resetada: ${reason}`));
   } catch (error) {
-    lastError = error?.stack || String(error);
-    connectionStatus = 'erro ao limpar sessão';
-  } finally {
-    autoResetInProgress = false;
+    console.log('End ignorado:', error?.message || error);
   }
+
+  currentSock = null;
+  currentQr = null;
+  lastPairingCode = null;
+  lastPairingGeneratedAt = null;
+  currentSocketId += 1;
+
+  const supabase = getSupabase();
+  const { error } = await supabase.from('bot_auth').delete().neq('id', LOCK_ID);
+  if (error) throw error;
+
+  connectionStatus = 'sessão limpa, aguardando novo QR';
 }
 
 app.get('/', (req, res) => {
   res.send(page(BOT_NAME, `
     <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
     <p>Status: <strong class="status">${escapeHtml(connectionStatus)}</strong></p>
-
-    <div class="box" style="margin-bottom:18px">
-      <p class="warn"><strong>Recomendado:</strong> conecte pelo QR Code. O código de pareamento pode expirar rápido em hospedagem por container.</p>
-    </div>
-
+    <div class="box" style="margin-bottom:18px"><p class="warn"><strong>Importante:</strong> deixe apenas uma instância do bot ativa. Duas instâncias quebram a sessão do WhatsApp.</p></div>
     <div class="grid">
-      <div class="box">
-        <h2>Conectar por QR Code</h2>
-        <p class="muted">Método mais estável.</p>
-        <form action="/qr" method="GET">
-          <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
-          <button type="submit">Abrir QR Code</button>
-        </form>
-      </div>
-
-      <div class="box">
-        <h2>Conectar por código</h2>
-        <p class="muted">Use só se for digitar imediatamente. Exemplo de número: <strong>5598999999999</strong>.</p>
-        <form action="/pairing" method="GET">
-          <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
-          <input name="phone" type="tel" inputmode="numeric" placeholder="Número com DDI e DDD" required />
-          <button class="secondary" type="submit">Gerar código novo</button>
-        </form>
-      </div>
+      <div class="box"><h2>Conectar por QR Code</h2><p class="muted">Método mais estável.</p><form action="/qr" method="GET"><input name="key" type="password" placeholder="Senha do QR_PASSWORD" required /><button type="submit">Abrir QR Code</button></form></div>
+      <div class="box"><h2>Conectar por código</h2><p class="muted">Use só se for digitar imediatamente.</p><form action="/pairing" method="GET"><input name="key" type="password" placeholder="Senha do QR_PASSWORD" required /><input name="phone" type="tel" inputmode="numeric" placeholder="Número com DDI e DDD" required /><button class="secondary" type="submit">Gerar código novo</button></form></div>
     </div>
-
-    <div class="box" style="margin-top:18px">
-      <h2>Resetar sessão</h2>
-      <p class="muted">Use se aparecer “Connection Failure”, “Bad MAC”, “MessageCounterError”, “código expirado” ou se o QR não conectar.</p>
-      <form action="/reset-session" method="GET">
-        <input name="key" type="password" placeholder="Senha do QR_PASSWORD" autocomplete="current-password" required />
-        <button class="danger" type="submit">Limpar sessão do WhatsApp</button>
-      </form>
-    </div>
-
+    <div class="box" style="margin-top:18px"><h2>Resetar sessão</h2><p class="muted">Use após remover dispositivos antigos no WhatsApp.</p><form action="/reset-session" method="GET"><input name="key" type="password" placeholder="Senha do QR_PASSWORD" required /><button class="danger" type="submit">Limpar sessão do WhatsApp</button></form></div>
     <p class="muted">Diagnóstico: <a href="/status">/status</a></p>
     ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
   `));
@@ -230,13 +250,19 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => res.status(200).send('ok'));
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
-app.get('/status', (req, res) => {
+app.get('/status', async (req, res) => {
+  let lock = null;
+  try { lock = await readRuntimeLock(); } catch {}
+
   res.json({
     ok: true,
     bot: BOT_NAME,
+    instanceId: INSTANCE_ID,
     status: connectionStatus,
     qrDisponivel: Boolean(currentQr),
     socketDisponivel: Boolean(currentSock),
+    hasRuntimeLock,
+    runtimeLock: lock,
     socketId: currentSocketId,
     pairingCodeDisponivel: Boolean(lastPairingCode),
     lastPairingGeneratedAt,
@@ -245,7 +271,9 @@ app.get('/status', (req, res) => {
     env: {
       SUPABASE_URL: Boolean(process.env.SUPABASE_URL),
       SUPABASE_SERVICE_ROLE_KEY: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-      QR_PASSWORD: Boolean(process.env.QR_PASSWORD)
+      QR_PASSWORD: Boolean(process.env.QR_PASSWORD),
+      ALLOWED_GROUP_ID: Boolean(process.env.ALLOWED_GROUP_ID),
+      OWNER_NUMBER: Boolean(process.env.OWNER_NUMBER)
     },
     lastError
   });
@@ -255,105 +283,46 @@ app.get('/qr', async (req, res) => {
   if (!keyOk(req)) return accessDenied(res);
 
   if (!currentQr) {
-    return res.send(page('QR Code', `
-      <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
-      <p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p>
-      <p>Nenhum QR Code disponível agora. A página atualiza automaticamente a cada 5 segundos.</p>
-      <p class="muted">Se ficar assim por muito tempo, volte e use “Limpar sessão do WhatsApp”.</p>
-      ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
-    `, 'body { text-align: center; }').replace('</head>', '<meta http-equiv="refresh" content="5" /></head>'));
+    return res.send(page('QR Code', `<h1>⚔️ ${escapeHtml(BOT_NAME)}</h1><p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p><p>Nenhum QR Code disponível agora. A página atualiza automaticamente.</p>${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}`, 'body { text-align: center; }').replace('</head>', '<meta http-equiv="refresh" content="5" /></head>'));
   }
 
   const qrImage = await QRCode.toDataURL(currentQr);
-
-  return res.send(page('QR Code', `
-    <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
-    <p>Abra o WhatsApp → Dispositivos conectados → Conectar dispositivo.</p>
-    <img src="${qrImage}" alt="QR Code do WhatsApp" />
-    <p>Depois de conectar, teste no grupo: <strong>!menu</strong></p>
-  `, 'body { text-align: center; } img { width: 300px; max-width: 90%; background: white; padding: 12px; border-radius: 12px; }'));
+  return res.send(page('QR Code', `<h1>⚔️ ${escapeHtml(BOT_NAME)}</h1><p>Abra o WhatsApp → Dispositivos conectados → Conectar dispositivo.</p><img src="${qrImage}" alt="QR Code do WhatsApp" /><p>Depois teste no grupo: <strong>!menu</strong></p>`, 'body { text-align: center; } img { width: 300px; max-width: 90%; background: white; padding: 12px; border-radius: 12px; }'));
 });
 
 app.get('/pairing', async (req, res) => {
   if (!keyOk(req)) return accessDenied(res);
   const phone = onlyDigits(req.query.phone);
-
-  if (!phone || phone.length < 10) {
-    return res.status(400).send(page('Número inválido', `
-      <h1>📱 Número inválido</h1>
-      <p>Informe o número com DDI e DDD. Exemplo: <strong>5598999999999</strong>.</p>
-      <a href="/">Voltar</a>
-    `));
-  }
-
-  if (connectionStatus === 'conectado') {
-    return res.send(page('Já conectado', `
-      <h1>✅ Bot já conectado</h1>
-      <p>O WhatsApp já está pareado. Teste no grupo com <strong>!menu</strong>.</p>
-      <a href="/status">Ver status</a>
-    `));
-  }
-
-  if (!currentSock) {
-    connectToWhatsApp();
-    return res.status(503).send(page('Bot iniciando', `
-      <h1>⏳ Bot iniciando</h1>
-      <p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p>
-      <p>Aguarde uns 5 segundos e gere o código novamente.</p>
-      ${lastError ? `<pre>${escapeHtml(lastError)}</pre>` : ''}
-    `));
-  }
+  if (!phone || phone.length < 10) return res.status(400).send(page('Número inválido', `<h1>📱 Número inválido</h1><p>Informe o número com DDI e DDD.</p><a href="/">Voltar</a>`));
+  if (connectionStatus === 'conectado') return res.send(page('Já conectado', `<h1>✅ Bot já conectado</h1><p>Teste no grupo com <strong>!menu</strong>.</p>`));
+  if (!currentSock) return res.status(503).send(page('Bot iniciando', `<h1>⏳ Bot iniciando</h1><p>Status: <strong>${escapeHtml(connectionStatus)}</strong></p><p>Aguarde e tente novamente.</p>`));
 
   try {
-    if (typeof currentSock.requestPairingCode !== 'function') {
-      throw new Error('Esta versão do Baileys não possui requestPairingCode. Use o QR Code.');
-    }
-
+    if (typeof currentSock.requestPairingCode !== 'function') throw new Error('Esta versão do Baileys não possui requestPairingCode. Use o QR Code.');
     connectionStatus = 'gerando código de pareamento';
-    lastError = null;
-
     const code = await currentSock.requestPairingCode(phone);
     lastPairingCode = code;
     lastPairingGeneratedAt = new Date().toISOString();
     connectionStatus = 'aguardando código no WhatsApp';
-
-    return res.send(page('Código de pareamento', `
-      <h1>🔐 Código de pareamento</h1>
-      <p>Digite este código imediatamente no WhatsApp do número <strong>${escapeHtml(phone)}</strong>:</p>
-      <pre class="code">${escapeHtml(code)}</pre>
-      <p class="warn"><strong>Importante:</strong> esse código expira rápido. Se aparecer “expirado”, gere outro ou use QR Code.</p>
-      <p class="muted">Se continuar expirando, clique em <strong>Limpar sessão do WhatsApp</strong> e use o QR Code.</p>
-      <a href="/status">Ver status</a>
-    `));
+    return res.send(page('Código de pareamento', `<h1>🔐 Código de pareamento</h1><p>Digite imediatamente no WhatsApp do número <strong>${escapeHtml(phone)}</strong>:</p><pre class="code">${escapeHtml(code)}</pre><p class="warn">Se expirar, use QR Code.</p>`));
   } catch (error) {
     lastError = error?.stack || String(error);
     connectionStatus = 'erro ao gerar código';
-    return res.status(500).send(page('Erro ao gerar código', `
-      <h1>❌ Erro ao gerar código</h1>
-      <pre>${escapeHtml(lastError)}</pre>
-      <a href="/">Voltar</a>
-    `));
+    return res.status(500).send(page('Erro ao gerar código', `<h1>❌ Erro ao gerar código</h1><pre>${escapeHtml(lastError)}</pre><a href="/">Voltar</a>`));
   }
 });
 
 app.get('/reset-session', async (req, res) => {
   if (!keyOk(req)) return accessDenied(res);
-  await clearWhatsappSession('manual');
-  setTimeout(() => {
-    reconnecting = false;
-    connectToWhatsApp();
-  }, 2000);
-  return res.send(page('Sessão limpa', `
-    <h1>✅ Sessão limpa</h1>
-    <p>A sessão antiga do WhatsApp foi removida do Supabase.</p>
-    <p>Aguarde alguns segundos e use o <strong>QR Code</strong>.</p>
-    <a href="/">Voltar</a>
-  `));
-});
-
-app.get('/pair', (req, res) => {
-  const params = new URLSearchParams(req.query).toString();
-  res.redirect(`/pairing${params ? `?${params}` : ''}`);
+  try {
+    await clearWhatsappSession('manual');
+    await releaseRuntimeLock();
+    setTimeout(connectToWhatsApp, 3000);
+    return res.send(page('Sessão limpa', `<h1>✅ Sessão limpa</h1><p>A sessão antiga foi removida. Aguarde alguns segundos e use o <strong>QR Code</strong>.</p><a href="/">Voltar</a>`));
+  } catch (error) {
+    lastError = error?.stack || String(error);
+    return res.status(500).send(page('Erro ao limpar sessão', `<h1>❌ Erro ao limpar sessão</h1><pre>${escapeHtml(lastError)}</pre>`));
+  }
 });
 
 app.get('/:key', (req, res) => {
@@ -373,6 +342,14 @@ async function connectToWhatsApp() {
       reconnecting = false;
       return;
     }
+
+    const gotLock = await acquireRuntimeLock();
+    if (!gotLock) {
+      reconnecting = false;
+      setTimeout(connectToWhatsApp, 30_000);
+      return;
+    }
+    startRuntimeHeartbeat();
 
     connectionStatus = 'carregando módulos';
     const { pino, makeWASocket, DisconnectReason, fetchLatestBaileysVersion, useSupabaseAuthState, handleCommand } = loadBotModules();
@@ -406,11 +383,9 @@ async function connectToWhatsApp() {
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (socketId !== currentSocketId) return;
       if (type !== 'notify') return;
-
       for (const msg of messages) {
         try {
-          if (!msg.message) continue;
-          if (msg.key.fromMe) continue;
+          if (!msg.message || msg.key.fromMe) continue;
           await handleCommand(sock, msg);
         } catch (error) {
           lastError = error?.stack || String(error);
@@ -421,7 +396,6 @@ async function connectToWhatsApp() {
 
     sock.ev.on('connection.update', async (update) => {
       if (socketId !== currentSocketId) return;
-
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -435,34 +409,33 @@ async function connectToWhatsApp() {
         lastPairingGeneratedAt = null;
         connectionStatus = 'conectado';
         lastError = null;
-        console.log(`${BOT_NAME} conectado ao WhatsApp.`);
+        console.log(`${BOT_NAME} conectado ao WhatsApp. instance=${INSTANCE_ID}`);
       }
 
       if (connection === 'close') {
         currentSock = null;
+        await releaseRuntimeLock();
+
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errorText = lastDisconnect?.error?.stack || lastDisconnect?.error?.message || String(lastDisconnect?.error || '');
         const deslogado = statusCode === DisconnectReason.loggedOut;
         const falhaSessao = deslogado || isSessionFailure(errorText, statusCode);
 
         lastError = errorText || `Conexão fechada. Status: ${statusCode}`;
-        console.log('Conexão fechada.', { statusCode, deslogado, falhaSessao });
+        console.log('Conexão fechada.', { statusCode, deslogado, falhaSessao, instance: INSTANCE_ID });
 
         if (falhaSessao) {
           await clearWhatsappSession(`sessão inválida ${statusCode || ''}`.trim());
         }
 
         connectionStatus = falhaSessao ? 'sessão limpa, gere novo QR' : 'reconectando';
-
-        setTimeout(() => {
-          reconnecting = false;
-          connectToWhatsApp();
-        }, falhaSessao ? 12000 : 6000);
+        setTimeout(connectToWhatsApp, falhaSessao ? 12_000 : 6_000);
       }
     });
   } catch (error) {
     currentSock = null;
     reconnecting = false;
+    await releaseRuntimeLock();
     lastError = error?.stack || String(error);
     console.error('Erro ao conectar:', error);
     connectionStatus = 'erro ao conectar';
@@ -471,11 +444,11 @@ async function connectToWhatsApp() {
       await clearWhatsappSession('erro ao conectar');
     }
 
-    setTimeout(connectToWhatsApp, 10000);
+    setTimeout(connectToWhatsApp, 10_000);
   }
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`${BOT_NAME} servidor HTTP rodando em 0.0.0.0:${PORT}`);
+  console.log(`${BOT_NAME} servidor HTTP rodando em 0.0.0.0:${PORT}. instance=${INSTANCE_ID}`);
   setTimeout(connectToWhatsApp, 1500);
 });
