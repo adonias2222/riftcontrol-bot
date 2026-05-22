@@ -1,10 +1,12 @@
 require('dotenv').config();
 
+const os = require('os');
 const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
 const baileys = require('@whiskeysockets/baileys');
 const handleCommand = require('./src/commands/handler');
+const { renderDashboard } = require('./src/web/dashboard');
 
 const makeWASocket = baileys.default || baileys.makeWASocket;
 const { useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, Browsers } = baileys;
@@ -13,6 +15,7 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const BOT_NAME = process.env.BOT_NAME || 'RiftControl';
 const QR_PASSWORD = process.env.QR_PASSWORD || '';
+const AUTH_FOLDER = process.env.AUTH_FOLDER || './auth_info';
 
 let sock = null;
 let currentQr = null;
@@ -20,10 +23,23 @@ let status = 'iniciando';
 let lastError = null;
 let startedAt = new Date().toISOString();
 let reconnecting = false;
+let lastQrAt = null;
+let lastOpenAt = null;
+let lastCloseAt = null;
+let lastConnectionUpdateAt = null;
+let lastDisconnectCode = null;
+let lastMessageAt = null;
+let lastCommandAt = null;
+let lastMessageInfo = null;
+let totalMessages = 0;
+let totalCommands = 0;
+let reconnectCount = 0;
+let qrCount = 0;
+let baileysVersion = null;
 
 function senhaOk(req) {
   if (!QR_PASSWORD) return true;
-  return req.query.key === QR_PASSWORD;
+  return req.query.key === QR_PASSWORD || req.headers['x-panel-key'] === QR_PASSWORD;
 }
 
 function escapeHtml(value) {
@@ -35,62 +51,114 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
-app.get('/health', (req, res) => {
-  res.status(200).send('ok');
-});
+function extrairTexto(msg) {
+  const message = msg?.message || {};
+  return (
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    ''
+  ).trim();
+}
 
-app.get('/status', (req, res) => {
-  res.json({
+function formatDuration(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const dias = Math.floor(total / 86400);
+  const horas = Math.floor((total % 86400) / 3600);
+  const minutos = Math.floor((total % 3600) / 60);
+  const segundos = total % 60;
+  if (dias > 0) return `${dias}d ${horas}h ${minutos}m`;
+  if (horas > 0) return `${horas}h ${minutos}m ${segundos}s`;
+  if (minutos > 0) return `${minutos}m ${segundos}s`;
+  return `${segundos}s`;
+}
+
+function montarStatus() {
+  const uptimeMs = Date.now() - new Date(startedAt).getTime();
+  return {
     ok: true,
     bot: BOT_NAME,
     status,
     conectado: status === 'conectado',
     qrDisponivel: Boolean(currentQr),
     socketDisponivel: Boolean(sock),
+    reconnecting,
     startedAt,
+    uptimeMs,
+    uptime: formatDuration(uptimeMs),
+    now: new Date().toISOString(),
     auth: 'local-useMultiFileAuthState',
+    authFolder: AUTH_FOLDER,
+    lastQrAt,
+    lastOpenAt,
+    lastCloseAt,
+    lastConnectionUpdateAt,
+    lastDisconnectCode,
+    lastMessageAt,
+    lastCommandAt,
+    lastMessageInfo,
+    totalMessages,
+    totalCommands,
+    reconnectCount,
+    qrCount,
+    baileysVersion,
+    process: {
+      pid: process.pid,
+      node: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      memoryMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      host: os.hostname()
+    },
     env: {
       QR_PASSWORD: Boolean(process.env.QR_PASSWORD),
       SUPABASE_URL: Boolean(process.env.SUPABASE_URL),
       SUPABASE_SERVICE_ROLE_KEY: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
       ALLOWED_GROUP_ID: Boolean(process.env.ALLOWED_GROUP_ID),
-      OWNER_NUMBER: Boolean(process.env.OWNER_NUMBER)
+      OWNER_NUMBER: Boolean(process.env.OWNER_NUMBER),
+      OWNER_ID: Boolean(process.env.OWNER_ID || process.env.OWNER_LID),
+      ONLY_GROUPS: process.env.ONLY_GROUPS || null,
+      LOG_LEVEL: process.env.LOG_LEVEL || 'silent'
     },
     lastError
-  });
+  };
+}
+
+app.use((req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).send('ok');
+});
+
+app.get('/status', (req, res) => {
+  res.json(montarStatus());
+});
+
+app.get('/api/status', (req, res) => {
+  res.json(montarStatus());
+});
+
+app.get('/api/qr', async (req, res) => {
+  if (!senhaOk(req)) {
+    return res.status(401).json({ ok: false, error: 'Senha incorreta.' });
+  }
+
+  if (!currentQr) {
+    return res.json({ ok: true, qrDisponivel: false, status, lastQrAt });
+  }
+
+  const qrImage = await QRCode.toDataURL(currentQr);
+  return res.json({ ok: true, qrDisponivel: true, status, lastQrAt, qrImage });
 });
 
 app.get('/', (req, res) => {
-  res.send(`
-    <html>
-      <head>
-        <title>${escapeHtml(BOT_NAME)}</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <style>
-          body { font-family: Arial, sans-serif; background: #0b1020; color: white; padding: 28px; }
-          .card { max-width: 760px; margin: auto; background: #151b2f; padding: 24px; border-radius: 18px; }
-          input, button { width: 100%; box-sizing: border-box; padding: 14px; margin: 8px 0; border-radius: 12px; border: 0; font-size: 16px; }
-          input { background: #050816; color: white; border: 1px solid #334155; }
-          button { background: #38bdf8; color: #020617; font-weight: bold; }
-          a { color: #7dd3fc; }
-          pre { background: #050816; padding: 12px; border-radius: 12px; white-space: pre-wrap; color: #fecaca; }
-        </style>
-      </head>
-      <body>
-        <div class="card">
-          <h1>⚔️ ${escapeHtml(BOT_NAME)}</h1>
-          <p>Status: <strong>${escapeHtml(status)}</strong></p>
-          <p>Essa versão usa autenticação local simples. O Supabase continua para os dados da guilda.</p>
-          <form action="/qr" method="GET">
-            <input name="key" type="password" placeholder="Senha QR_PASSWORD" />
-            <button type="submit">Abrir QR Code</button>
-          </form>
-          <p><a href="/status">Ver status</a></p>
-          ${lastError ? `<h3>Último erro</h3><pre>${escapeHtml(lastError)}</pre>` : ''}
-        </div>
-      </body>
-    </html>
-  `);
+  res.send(renderDashboard(escapeHtml(BOT_NAME)));
 });
 
 app.get('/qr', async (req, res) => {
@@ -120,9 +188,7 @@ app.get('/qr', async (req, res) => {
 
   res.send(`
     <html>
-      <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-      </head>
+      <head><meta name="viewport" content="width=device-width, initial-scale=1" /></head>
       <body style="font-family:Arial;background:#0b1020;color:white;text-align:center;padding:24px">
         <h1>${escapeHtml(BOT_NAME)}</h1>
         <p>Abra o WhatsApp do número do bot → Dispositivos conectados → Conectar dispositivo.</p>
@@ -135,15 +201,16 @@ app.get('/qr', async (req, res) => {
 
 async function iniciarBot() {
   if (reconnecting || sock) return;
-
   reconnecting = true;
 
   try {
     status = 'iniciando autenticação local';
     lastError = null;
 
-    const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
-    const { version } = await fetchLatestBaileysVersion();
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    const latest = await fetchLatestBaileysVersion();
+    const { version } = latest;
+    baileysVersion = version;
 
     status = 'conectando ao WhatsApp';
 
@@ -164,6 +231,9 @@ async function iniciarBot() {
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (!['notify', 'append'].includes(type)) return;
 
+      totalMessages += messages.length;
+      lastMessageAt = new Date().toISOString();
+
       console.log('messages.upsert recebido:', {
         type,
         total: messages.length,
@@ -176,6 +246,21 @@ async function iniciarBot() {
           if (!msg.message) continue;
           if (msg.key?.remoteJid === 'status@broadcast') continue;
 
+          const texto = extrairTexto(msg);
+          lastMessageInfo = {
+            type,
+            remoteJid: msg.key?.remoteJid,
+            participant: msg.key?.participant || null,
+            fromMe: Boolean(msg.key?.fromMe),
+            textPreview: texto ? texto.slice(0, 80) : null,
+            at: new Date().toISOString()
+          };
+
+          if (texto.startsWith('!')) {
+            totalCommands += 1;
+            lastCommandAt = new Date().toISOString();
+          }
+
           await handleCommand(sock, msg);
         } catch (error) {
           lastError = error?.stack || String(error);
@@ -186,10 +271,13 @@ async function iniciarBot() {
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      lastConnectionUpdateAt = new Date().toISOString();
 
       if (qr) {
         currentQr = qr;
         status = 'aguardando QR Code';
+        lastQrAt = new Date().toISOString();
+        qrCount += 1;
         console.log('QR Code gerado.');
       }
 
@@ -198,6 +286,7 @@ async function iniciarBot() {
         status = 'conectado';
         lastError = null;
         reconnecting = false;
+        lastOpenAt = new Date().toISOString();
         console.log(`${BOT_NAME} conectado ao WhatsApp.`);
       }
 
@@ -205,12 +294,11 @@ async function iniciarBot() {
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const erro = lastDisconnect?.error?.stack || lastDisconnect?.error?.message || String(lastDisconnect?.error || '');
 
+        lastDisconnectCode = statusCode || null;
+        lastCloseAt = new Date().toISOString();
         lastError = erro || `Conexão fechada. Status: ${statusCode}`;
 
-        console.log('Conexão fechada.', {
-          statusCode,
-          erro: lastError
-        });
+        console.log('Conexão fechada.', { statusCode, erro: lastError });
 
         sock = null;
         reconnecting = false;
@@ -221,6 +309,7 @@ async function iniciarBot() {
         }
 
         status = 'reconectando';
+        reconnectCount += 1;
         setTimeout(iniciarBot, 10_000);
       }
     });
@@ -229,9 +318,8 @@ async function iniciarBot() {
     reconnecting = false;
     status = 'erro ao conectar';
     lastError = error?.stack || String(error);
-
+    reconnectCount += 1;
     console.error('Erro ao iniciar bot:', error);
-
     setTimeout(iniciarBot, 15_000);
   }
 }
