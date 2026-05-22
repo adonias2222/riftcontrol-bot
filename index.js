@@ -12,7 +12,7 @@ const INSTANCE_ID = `${os.hostname()}-${process.pid}-${Math.random().toString(36
 
 const LOCK_ID = '__runtime_lock';
 const LOCK_TTL_MS = 90_000;
-const AUTO_RESET_SESSION = String(process.env.AUTO_RESET_SESSION || 'true').toLowerCase() === 'true';
+const AUTO_RESET_SESSION = true; // auto-recuperação sempre ativa
 
 let currentQr = null;
 let currentSock = null;
