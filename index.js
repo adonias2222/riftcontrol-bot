@@ -683,12 +683,12 @@ app.get('/clear-bad-session', async (req, res) => {
     return res.send(
       page(
         'Sessão corrompida limpa',
-        \`
+        `
           <h1>✅ Sessão corrompida limpa!</h1>
           <p>Os dados de criptografia foram removidos do Supabase.</p>
           <p>O bot vai reconectar em instantes — use <strong>/qr</strong> para escanear o QR Code novamente.</p>
           <a href="/">Voltar</a>
-        \`
+        `
       )
     );
   } catch (error) {
@@ -697,10 +697,10 @@ app.get('/clear-bad-session', async (req, res) => {
     return res.status(500).send(
       page(
         'Erro',
-        \`
+        `
           <h1>❌ Erro ao limpar sessão</h1>
-          <pre>\${escapeHtml(lastError)}</pre>
-        \`
+          <pre>${escapeHtml(lastError)}</pre>
+        `
       )
     );
   }
