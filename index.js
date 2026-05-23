@@ -7,6 +7,7 @@ const pino = require('pino');
 const baileys = require('@whiskeysockets/baileys');
 const handleCommand = require('./src/commands/handler');
 const { renderDashboard } = require('./src/web/dashboard');
+const { usePersistentLocalAuthState } = require('./src/auth/persistentLocalAuth');
 
 const makeWASocket = baileys.default || baileys.makeWASocket;
 const { useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, Browsers } = baileys;
@@ -16,6 +17,7 @@ const PORT = Number(process.env.PORT || 3000);
 const BOT_NAME = process.env.BOT_NAME || 'RiftControl';
 const QR_PASSWORD = process.env.QR_PASSWORD || '';
 const AUTH_FOLDER = process.env.AUTH_FOLDER || './auth_info';
+const PERSIST_AUTH = String(process.env.PERSIST_AUTH || 'true').toLowerCase() !== 'false';
 
 let sock = null;
 let currentQr = null;
@@ -40,6 +42,8 @@ let lastPairingCode = null;
 let lastPairingPhone = null;
 let lastPairingAt = null;
 let pairingCount = 0;
+let lastAuthBackupAt = null;
+let lastAuthMode = PERSIST_AUTH ? 'local+persistent-supabase' : 'local-only';
 
 function senhaOk(req) {
   if (!QR_PASSWORD) return true;
@@ -100,8 +104,10 @@ function montarStatus() {
     uptimeMs,
     uptime: formatDuration(uptimeMs),
     now: new Date().toISOString(),
-    auth: 'local-useMultiFileAuthState + pairing-code',
+    auth: lastAuthMode,
     authFolder: AUTH_FOLDER,
+    persistAuth: PERSIST_AUTH,
+    lastAuthBackupAt,
     lastQrAt,
     lastOpenAt,
     lastCloseAt,
@@ -131,7 +137,8 @@ function montarStatus() {
       OWNER_NUMBER: Boolean(process.env.OWNER_NUMBER),
       OWNER_ID: Boolean(process.env.OWNER_ID || process.env.OWNER_LID),
       ONLY_GROUPS: process.env.ONLY_GROUPS || null,
-      LOG_LEVEL: process.env.LOG_LEVEL || 'silent'
+      LOG_LEVEL: process.env.LOG_LEVEL || 'silent',
+      PERSIST_AUTH
     },
     lastError
   };
@@ -147,7 +154,7 @@ async function gerarPairingCode(phone) {
   }
 
   if (status === 'conectado') {
-    const erro = new Error('O bot já está conectado ao WhatsApp. Para parear outro número, limpe a pasta auth_info ou recrie o deploy sem sessão antiga.');
+    const erro = new Error('O bot já está conectado ao WhatsApp. Para parear outro número, limpe a sessão atual antes.');
     erro.statusCode = 409;
     throw erro;
   }
@@ -336,10 +343,14 @@ async function iniciarBot() {
   reconnecting = true;
 
   try {
-    status = 'iniciando autenticação local';
+    status = 'iniciando autenticação persistente';
     lastError = null;
 
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    const auth = PERSIST_AUTH
+      ? await usePersistentLocalAuthState(AUTH_FOLDER, useMultiFileAuthState)
+      : await useMultiFileAuthState(AUTH_FOLDER);
+
+    const { state, saveCreds, backupNow } = auth;
     const latest = await fetchLatestBaileysVersion();
     const { version } = latest;
     baileysVersion = version;
@@ -358,7 +369,10 @@ async function iniciarBot() {
       keepAliveIntervalMs: 25_000
     });
 
-    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('creds.update', async () => {
+      await saveCreds();
+      lastAuthBackupAt = new Date().toISOString();
+    });
 
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
       if (!['notify', 'append'].includes(type)) return;
@@ -420,6 +434,15 @@ async function iniciarBot() {
         lastError = null;
         reconnecting = false;
         lastOpenAt = new Date().toISOString();
+
+        if (backupNow) {
+          backupNow().then(() => {
+            lastAuthBackupAt = new Date().toISOString();
+          }).catch((error) => {
+            lastError = error?.stack || String(error);
+          });
+        }
+
         console.log(`${BOT_NAME} conectado ao WhatsApp.`);
       }
 
